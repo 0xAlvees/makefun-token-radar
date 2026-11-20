@@ -1,7 +1,7 @@
 // Token Radar's entrypoint (Node 22, standard library only).
 //
 // It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
-// pre-token protocol with the radar-2 model in lib/model.ts, writes the ranked board to
+// protocol in it with the radar-3 model in lib/model.ts, writes the ranked board to
 // /output/board.json, writes the dashboard's data to /output/data.js, copies this repository's
 // dashboard/ and screenshots/ to /output, and writes /output/dossier.json with the vendored
 // make.fun library. The program runs twice in grading and both runs must write the same bytes,
@@ -82,7 +82,12 @@ for (const name of shots) {
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
+const cv = radar.validation.folds[0]!;
+const split = radar.validation.split_80_20;
+const base = radar.validation.baseline;
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.pre_token_size} pre-token, ${radar.live_size} live, ${radar.token_trades_size} token-trades, ${radar.not_a_launch_size} not-a-launch)\n` +
+    `token radar: ${radar.model_version} log(mcap) = ${radar.intercept} + ${radar.slope} x log(tvl), ${radar.validation.train_protocols} live peers, ${cv.name}: log R2 ${cv.log_r2}, median APE ${cv.median_ape}, log RMSE ${cv.log_rmse}\n` +
+    `token radar: ${split.name}: log R2 ${split.log_r2}, median APE ${split.median_ape}, log RMSE ${split.log_rmse} (radar-2 median on the same folds: log R2 ${base.log_r2}, median APE ${base.median_ape})\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

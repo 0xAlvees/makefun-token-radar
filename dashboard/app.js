@@ -1,10 +1,8 @@
-// Token Radar's dashboard, radar-7. It reads window.RADAR (written beside dashboard/ by main.ts)
-// and renders the ranked board, a KPI strip, an integrity strip, a top-3 launch spotlight, a
-// filterable table, a per-protocol detail view with the model's own inputs, its farm verdict and
-// the protocol's farm plan, and the fitted curve with the held-out validation. No network: every
-// byte it shows is in data.js.
-// The page recomputes each row from the snapshot figures with the same function main.ts runs,
-// so the screenshots and board.json agree.
+// Token Radar's dashboard, radar-8. It reads window.RADAR (written beside dashboard/ by
+// main.ts) and renders the board, KPI and integrity strips, top-3 spotlight, filterable
+// table, per-protocol detail view and model panel. No network: every byte shown is in
+// data.js. Each row is recomputed with the same function main.ts runs, so the page and
+// board.json agree.
 (function () {
   'use strict';
 
@@ -62,18 +60,24 @@
     var odds = (catRate + tierRate) / 2;
     return { odds: Math.min(DATA.model.odds_cap, Math.max(DATA.model.odds_floor, odds)), catRate: catRate, tierRate: tierRate };
   }
-  // The radar-7 odds: a logistic regression on log TVL, log age, seven-day growth, log chain
-  // count and the category's smoothed token rate. Same features, same standardization and the
-  // same dot product main.ts runs, so the recompute matches board.json.
+  // The radar-8 odds: a logistic regression on log TVL, log age, seven-day growth, log chain
+  // count, the category's smoothed token rate, and a listed-2024-or-later step. Same features,
+  // same standardization and the same dot product main.ts runs, so the recompute matches
+  // board.json. A protocol with no listed date takes the step's 0.
   function catRateFor(row) {
     var cat = DATA.odds.by_category[row.category || 'Other'];
     return cat ? smoothRate(cat.tok, cat.n) : DATA.odds.global;
+  }
+  function eraStep(row) {
+    if (!row.listed_at) return 0;
+    var year = parseInt(String(row.listed_at).slice(0, 4), 10);
+    return (isFinite(year) && year >= DATA.model.odds_era_year) ? 1 : 0;
   }
   function logitOdds(row) {
     var m = DATA.model;
     var age = (row.age_days === null || row.age_days === undefined) ? m.unknown_age_days : row.age_days;
     var growth = Math.min(m.growth_cap, Math.max(m.growth_floor, (row.change_7d === null || row.change_7d === undefined) ? 0 : row.change_7d));
-    var x = [1, Math.log(Math.max(1, row.tvl_usd)), Math.log(Math.max(1, age)), growth / 100, Math.log(Math.max(1, (row.chains || []).length)), catRateFor(row)];
+    var x = [1, Math.log(Math.max(1, row.tvl_usd)), Math.log(Math.max(1, age)), growth / 100, Math.log(Math.max(1, (row.chains || []).length)), catRateFor(row), eraStep(row)];
     var s = 0;
     for (var j = 0; j < x.length; j++) {
       var zj = j === 0 ? x[j] : (x[j] - DATA.logit.mu[j]) / DATA.logit.sd[j];
@@ -349,7 +353,7 @@
         el('b', { text: String(DATA.pre_token_size) }), ' launch candidates, ',
         el('b', { text: String(DATA.live_size) }), ' already trading, ',
         el('b', { text: String(DATA.token_trades_size) }), ' whose token already trades through another name, and ',
-        el('b', { text: String(DATA.not_a_launch_size) }), ' that are not a launch. A launch candidate is ranked by its fitted value times the odds it ever records a token; a live protocol is ranked by its market cap, a fact. Each launch candidate carries a farm verdict — FARM, THIN or SKIP — from its expected net at the low end of its value band against the cost of farming it. TVL ≠ token value: this is a peer-multiple estimate, not a value-capture estimate. Implied value is a model, not a promise.'
+        el('b', { text: String(DATA.not_a_launch_size) }), ' that are not a launch. A launch candidate is ranked by its fitted value times the odds it ever records a token; a live protocol is ranked by its market cap, a fact. Each launch candidate carries a farm verdict — FARM, THIN or SKIP — from its expected net at the low end of its value band. TVL ≠ token value: this is a peer-multiple estimate, not a value-capture estimate. Implied value is a model, not a promise.'
       )
     );
   }
@@ -528,15 +532,15 @@
       ),
       el('p', { class: 'model-note' },
         el('b', { text: 'The fitted value: ' }),
-        'a regression of log market cap on log TVL, fit by least squares on the ', String(v.train_protocols), ' protocols that already trade, with each category taking its median residual shrunk toward zero by a prior weight of ', String(m.peer_prior_weight), '. The fitted value is the conditional median: exp() of the log prediction, with no smearing correction. Growth, maturity and chain are bounded multipliers (growth 1 + clamp(change_7d, ', String(m.growth_floor), ', ', String(m.growth_cap), ') / 100 x ', String(m.growth_weight), '; maturity ', String(m.maturity_floor), ' + min(age, ', String(m.maturity_days), ') / ', String(m.maturity_days), ' x ', String(m.maturity_range), '; chain 1 + 0.02 x min(chains - 1, 5)). They were tested as fitted terms too, by the program, on five-fold cross-validation — held-out log R2: ', ftText, '. Every extra term hurts, so they stay bounded multipliers, not fitted terms. The value band is fitted x ', DATA.value_band.lo_mult.toFixed(2), ' to fitted x ', DATA.value_band.hi_mult.toFixed(1), ' (10th–90th percentile of the ', String(v.train_protocols), ' live peers\u2019 residuals of log market cap against log fitted value); the farm verdict uses the low end. ',
+        'a regression of log market cap on log TVL, fit by a Huber robust regression on the ', String(v.train_protocols), ' protocols that already trade: iteratively reweighted least squares, delta ', String(m.huber_delta), ', MAD scale, at most ', String(m.huber_max_iterations), ' iterations from the least-squares fit. Log residuals are heavy-tailed, so the Huber line downweights outlier peers. Each category takes its median residual shrunk toward zero by a prior weight of ', String(m.peer_prior_weight), '. The fitted value is the conditional median: exp() of the log prediction, with no smearing correction. Growth, maturity and chain are bounded multipliers (growth 1 + clamp(change_7d, ', String(m.growth_floor), ', ', String(m.growth_cap), ') / 100 x ', String(m.growth_weight), '; maturity ', String(m.maturity_floor), ' + min(age, ', String(m.maturity_days), ') / ', String(m.maturity_days), ' x ', String(m.maturity_range), '; chain 1 + 0.02 x min(chains - 1, 5)). They were tested as fitted terms too, on five-fold cross-validation — held-out log R2: ', ftText, '. Every extra term hurts, so they stay bounded multipliers, not fitted terms. The value band is fitted x ', DATA.value_band.lo_mult.toFixed(2), ' to fitted x ', DATA.value_band.hi_mult.toFixed(1), ' (10th–90th percentile of the live peers\u2019 log residuals); the farm verdict uses the low end. ',
         el('b', { text: 'The odds: ' }),
-        'for a launch candidate, a logistic regression on log TVL, log age, seven-day growth, log chain count and its category token rate (Laplace-smoothed toward the global rate (', (DATA.global_token_rate * 100).toFixed(1), '%) with a prior weight of ', String(m.odds_prior_weight), '), standardized, gradient descent lr ', String(m.logit_lr), ', ', String(m.logit_iterations), ' iterations, clamped to [', String(m.odds_floor), ', ', String(m.odds_cap), ']. Coefficients: ', v.logit_coefficients.map(function (b) { return b.toFixed(3); }).join(', '), '. Held-out Brier ', v.odds_comparison.logistic.brier.toFixed(4), ' and log-loss ', v.odds_comparison.logistic.log_loss.toFixed(4), ', against the radar-3 smoothed average (category rate plus TVL-tier rate, halved): Brier ', v.odds_comparison.smoothed.brier.toFixed(4), ', log-loss ', v.odds_comparison.smoothed.log_loss.toFixed(4), '. A protocol that cannot launch (exchange, bridge, liquid-staking product, versioned pool, wrapped or staked name) takes a structural floor of ', String(m.odds_non_launch), '.'
+        'for a launch candidate, a logistic regression on log TVL, log age, seven-day growth, log chain count, its category token rate (Laplace-smoothed toward the global rate (', (DATA.global_token_rate * 100).toFixed(1), '%) with a prior weight of ', String(m.odds_prior_weight), ') and a listed-', String(m.odds_era_year), '-or-later step, standardized, gradient descent lr ', String(m.logit_lr), ', ', String(m.logit_iterations), ' iterations, clamped to [', String(m.odds_floor), ', ', String(m.odds_cap), ']. Coefficients: ', v.logit_coefficients.map(function (b) { return b.toFixed(3); }).join(', '), '. Held-out Brier ', v.odds_comparison.logistic.brier.toFixed(4), ' and log-loss ', v.odds_comparison.logistic.log_loss.toFixed(4), ', against the radar-3 smoothed average (category rate plus TVL-tier rate, halved): Brier ', v.odds_comparison.smoothed.brier.toFixed(4), ', log-loss ', v.odds_comparison.smoothed.log_loss.toFixed(4), '. The era step is there because the token rate is a step in listing time: 78–80% pre-2024, 51% in 2024, 39% in 2025, 31% in 2026. No listed date takes 0 (token rate 0.79 over 113 protocols, as pre-2024). A young protocol\u2019s lower odds partly reflect less time to launch, not a verdict that it never will. A protocol that cannot launch (exchange, bridge, liquid-staking product, versioned pool, wrapped or staked name) takes a structural floor of ', String(m.odds_non_launch), '.'
       ),
       el('div', { class: 'model-grid' },
         el('div', null,
           el('h3', { text: 'The fitted curve' }),
           el('div', { class: 'curve', html: curveSvg() }),
-          el('p', { class: 'model-note', text: 'Each dot is one of the ' + v.train_protocols + ' live-token protocols, log market cap against log TVL. The line is the regression. A slope below 1 means a bigger protocol is worth less per dollar of TVL: the size effect the first radar\'s flat median missed.' })
+          el('p', { class: 'model-note', text: 'Each dot is one live-token protocol, log market cap against log TVL. A slope below 1 means a bigger protocol is worth less per dollar of TVL.' })
         ),
         el('div', null,
           el('h3', { text: 'Held-out validation' }),
@@ -562,7 +566,7 @@
               vrow('Naive median mcap/TVL multiple', v.naive_control, false)
             )
           ),
-          el('p', { class: 'model-note', text: 'Two-sided proof: the control is the simplest model that could plausibly rank launches — one global median multiple of market cap to TVL, fit on the training folds only, no regression, no category offsets, no multipliers — scored on the same folds. It scores log R2 ' + fmtR2(v.naive_control.log_r2) + ' with a median error of ' + (v.naive_control.median_ape * 100).toFixed(0) + '%; the fitted model beats it by ' + (cv.log_r2 - v.naive_control.log_r2).toFixed(3) + ' of log R2. The validation is real because the control fails: had the fitted model scored no better than a single median multiple, the whole ranking would be a flat multiple in disguise.' })
+          el('p', { class: 'model-note', text: 'Two-sided proof: the control is one global median mcap/TVL multiple, fit on the training folds only, scored on the same folds. It scores log R2 ' + fmtR2(v.naive_control.log_r2) + ' with a median error of ' + (v.naive_control.median_ape * 100).toFixed(0) + '%; the fitted model beats it by ' + (cv.log_r2 - v.naive_control.log_r2).toFixed(3) + ' of log R2. The validation is real because the control fails: had the fitted model scored no better, the ranking would be a flat multiple in disguise.' })
         ),
         el('div', null,
           el('h3', { text: 'Walk-forward: tested forward in time' }),
@@ -584,7 +588,7 @@
                 el('td', { class: 'num', text: (v.walk_forward.pooled.median_ape * 100).toFixed(0) + '%' }))])
             )
           ),
-          el('p', { class: 'model-note', text: 'Five time folds by listed date, each trained on all earlier protocols and tested on the next 19. The comps curve held forward in time until the 2024 cohort, then the regime shifted: newer protocols price mcap/TVL differently, so the pooled R2 is lower than the shuffled five-fold one. Leave-one-out agrees with the shuffle: log R2 ' + fmtR2(v.loo.log_r2) + ', median error ' + (v.loo.median_ape * 100).toFixed(0) + '%.' })
+          el('p', { class: 'model-note', text: 'Five time folds by listed date, each trained on all earlier protocols. The comps curve held until the 2024 cohort, then the regime shifted, so the pooled R2 is lower than the shuffled five-fold one. Leave-one-out agrees: log R2 ' + fmtR2(v.loo.log_r2) + ', median error ' + (v.loo.median_ape * 100).toFixed(0) + '%.' })
         ),
         el('div', null,
           el('h3', { text: 'Held-out calibration of the odds' }),
@@ -600,12 +604,12 @@
               })
             )
           ),
-          el('p', { class: 'model-note', text: 'Five-fold held-out predictions, binned by predicted odds. The low bins slightly under-predict and the top bin slightly over-predicts; the odds are used as scored, with no recalibration, because the bins are small.' })
+          el('p', { class: 'model-note', text: 'Five-fold held-out predictions, binned by predicted odds. The low bins slightly under-predict and the top bin slightly over-predicts; the odds are used as scored, with no recalibration.' })
         ),
         el('div', null,
           el('h3', { text: 'Farm verdicts' }),
           el('p', { class: 'model-note' },
-            'Launch candidates: FARM ', String(DATA.verdict_counts.FARM), ', THIN ', String(DATA.verdict_counts.THIN), ', SKIP ', String(DATA.verdict_counts.SKIP - DATA.not_a_launch_size), ' of ', String(DATA.pre_token_size), '. The verdict assumes the farmer holds 0.01% (one basis point) of the launch, so the expected gain is odds x 0.0001 x fitted-low value — the low end of the value band (fitted x ', DATA.value_band.lo_mult.toFixed(2), '); the cost is ', String(m.farm_tx_count), ' transactions of gas plus ', String(m.farm_capital_rate * 100), '% of the capital the plan deposits. FARM when the net clears $', String(m.farm_threshold_usd), ', THIN when it is positive, SKIP when it is not. A live or token-trades row is YIELD: farm for yield and points, no launch. The point-estimate net is shown on every row for comparison. The one-basis-point share is an assumption, stated here so the reader can argue with it — change it and the verdicts move.'
+            'Launch candidates: FARM ', String(DATA.verdict_counts.FARM), ', THIN ', String(DATA.verdict_counts.THIN), ', SKIP ', String(DATA.verdict_counts.SKIP - DATA.not_a_launch_size), ' of ', String(DATA.pre_token_size), '. The farmer holds 0.01% (one basis point) of the launch, so the expected gain is odds x 0.0001 x fitted-low value — the low end of the value band (fitted x ', DATA.value_band.lo_mult.toFixed(2), '); the cost is ', String(m.farm_tx_count), ' transactions of gas plus ', String(m.farm_capital_rate * 100), '% of the capital the plan deposits. FARM when the net clears $', String(m.farm_threshold_usd), ', THIN when it is positive, SKIP when it is not. A live or token-trades row is YIELD: farm for yield and points, no launch. The point-estimate net is shown on every row for comparison. The one-basis-point share is an assumption, stated here so the reader can argue with it — change it and the verdicts move.'
           )
         )
       )
@@ -663,6 +667,7 @@
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
+        el('div', null, el('span', { text: 'Listed ' + DATA.model.odds_era_year + ' or later (odds step)' }), el('b', { class: 'num', text: eraStep(row) ? 'yes' : 'no' })),
         el('div', null, el('span', { text: 'Fitted log market cap' }), el('b', { class: 'num', text: v.fittedLog.toFixed(2) })),
         el('div', null, el('span', { text: 'Category offset · ' + (row.category || 'Other') + ' (n=' + row.category_live_peers + ')' }), el('b', { class: 'num', text: (row.category_offset >= 0 ? '+' : '') + row.category_offset.toFixed(2) })),
         el('div', null, el('span', { text: 'Fitted value' }), el('b', { class: 'num', text: fmtUsd(v.fitted) })),
@@ -683,7 +688,7 @@
       ),
       el('p', { class: 'check' }, statusNote),
       calibrationText(row, v) ? el('p', { class: 'check', text: calibrationText(row, v) }) : null,
-      row.token_status === 'pre-token' ? el('p', { class: 'check', text: 'Farm verdict ' + row.farm_verdict + ': the expected gain assumes the farmer holds 0.01% (one basis point) of the launch — odds x 0.0001 x fitted-low value (fitted x ' + DATA.value_band.lo_mult.toFixed(2) + '), ' + fmtUsd(row.expected_gain_usd) + ' — against ' + fmtUsd(row.farm_cost_usd) + ' of gas and capital cost. At the point fitted value the net would be ' + fmtNet(row.expected_net_point_usd) + '. FARM when the net clears $' + DATA.model.farm_threshold_usd + ', THIN when it is positive, SKIP when it is not.' }) : null,
+      row.token_status === 'pre-token' ? el('p', { class: 'check', text: 'Farm verdict ' + row.farm_verdict + ': the farmer holds 0.01% (one basis point) of the launch — odds x 0.0001 x fitted-low value (fitted x ' + DATA.value_band.lo_mult.toFixed(2) + '), ' + fmtUsd(row.expected_gain_usd) + ' — against ' + fmtUsd(row.farm_cost_usd) + ' of gas and capital cost. At the point fitted value the net would be ' + fmtNet(row.expected_net_point_usd) + '. FARM when the net clears $' + DATA.model.farm_threshold_usd + ', THIN when it is positive, SKIP when it is not.' }) : null,
       el('p', { class: 'check' },
         'Model ' + DATA.model_version + ': the page recomputes this row as ',
         el('b', { text: fmtUsd(v.implied) }),
@@ -709,8 +714,8 @@
 
   function footer() {
     return el('footer', null,
-      el('p', { text: 'Data: DefiLlama protocol index, snapshot ' + DATA.as_of + '. A protocol is listed as no token when its record carries none; that is the record, not proof it has none.' }),
-      el('p', { text: 'Implied value is this radar\u2019s own model estimate. It is not a price, not a prediction that a token will launch, and not financial advice.' })
+      el('p', { text: 'Data: DefiLlama protocol index, snapshot ' + DATA.as_of + '. No token means its record carries none — the record, not proof it has none.' }),
+      el('p', { text: 'Implied value is this radar\u2019s own model estimate — not a price, not a prediction, not financial advice.' })
     );
   }
 

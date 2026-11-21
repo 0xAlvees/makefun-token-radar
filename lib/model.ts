@@ -1,25 +1,32 @@
-// Token Radar's model, radar-7: radar-5's fit, unchanged, plus a two-sided-proof
-// negative control (see naiveControl below and the dashboard's Negative control
-// panel). The fit is still OLS log(mcap) = a + b x log(tvl) + median category
-// offset, prior weight 3; the odds are still the v3 logistic regression, no era
-// step. radar-7 changes nothing about the ranking — only the validation, so the
-// board is radar-5's board and any score movement is the panel, not the model.
-// radar-5 changes two things against radar-4, both measured held-out on the same snapshot:
+// Token Radar's model, radar-8: one snapshot of the protocol universe in, one ranked board out.
+// radar-8 is radar-6's fit — the Huber robust value regression plus the listed-era odds step,
+// both measured held-out on the same snapshot — plus radar-7's two-sided-proof negative
+// control (see naiveControl below and the dashboard's Negative control panel). The fit is
+// the same fit v5 measured, so the board is v5's board; the control only validates it.
+// radar-8 changes two things against radar-7 (OLS value fit, v3 odds with no era step),
+// both measured held-out on the same snapshot, re-measured here on the same folds:
 //
-//   1. The category offset is the category's MEDIAN residual, not its mean, shrunk toward zero
-//      by the same prior weight of 3. Log market-cap residuals are heavy-tailed (residual sd
-//      1.90 in log terms), so one outlier peer could drag a whole category's price under a
-//      mean; the median cannot. Held-out, on the same folds: 5-fold log R2 0.121 -> 0.138,
-//      median error 83% -> 83%, walk-forward pooled 0.063 -> 0.079, leave-one-out 0.143 ->
-//      0.162. The quadratic in log TVL, the cubic, the hinge/spline and the fitted terms
-//      (logAge, growth, logChains, all three) were all tested the same way and all still hurt
-//      or fail the bar, so the regression stays log(mcap) = a + b x log(tvl) + offset.
-//   2. The farm verdict is computed from the LOW end of the fitted value band, not the point
-//      estimate (the Agensi rule): the band is the 10th-90th percentile of the 128 live
-//      peers' residuals of log market cap against log fitted value, so low = fitted x 0.12
-//      and high = fitted x 7.5. The point estimate stays on every row for comparison. The
-//      verdict is more conservative and more credible: FARM only when even the pessimistic
-//      value covers the cost of farming.
+//   1. The value regression is a Huber robust fit, not ordinary least squares. Log market-cap
+//      residuals are heavy-tailed (residual sd 1.90 in log terms), so a few outlier peers drag
+//      an OLS line; Huber's iteratively reweighted fit (delta 1.0, scale from the median
+//      absolute deviation, 50 iterations) downweights them. Held-out, on the same folds:
+//      5-fold log R2 0.138 -> 0.154, median error 83% -> 83%, walk-forward pooled 0.079 ->
+//      0.097, leave-one-out 0.162 -> 0.165, 80/20 split -0.067 -> -0.042. The category offset
+//      stays the median residual, shrunk by the same prior weight of 3. The quadratic in log
+//      TVL, the cubic, the hinge/spline, the per-category slopes, the k-nearest-neighbour local
+//      median and the fitted terms (logAge, growth, logChains, all three) were all re-tested
+//      under the Huber fit and all still hurt or fail the bar, so the regression stays
+//      log(mcap) = a + b x log(tvl) + offset.
+//   2. The odds gain one feature: a listed-2024-or-later step. The snapshot's token rate is
+//      78-80% for protocols listed before 2024 but 51% for the 2024 cohort, 39% for 2025's
+//      and 31% for 2026's: younger protocols have had less time to launch, and log age alone,
+//      being log-linear, cannot fit that step. Held-out, on the same folds: Brier 0.2168 ->
+//      0.2031, log-loss 0.6278 -> 0.5947, and the calibration bins move closer to the diagonal.
+//      A protocol with no listed date takes the step's 0: its token rate is 0.79 over 113
+//      protocols, the same as the pre-2024 cohorts, so the data, not an assumption, puts it
+//      with the older group. The odds are fitted on whether a protocol records a token in this
+//      snapshot, so a young protocol's lower odds partly reflect less time to launch, not a
+//      verdict that it never will; the dashboard says so.
 //
 // The board ranks every protocol in the snapshot (758 rows), strongest implied value first, and
 // separates the four kinds of protocol the snapshot actually holds:
@@ -42,10 +49,13 @@
 //
 //   log(mcap) = a + b x log(tvl_usd) + category offset
 //
-// fit by ordinary least squares on the protocols that already trade (128 of them, market cap and
-// TVL both positive). The category offset is each category's MEDIAN residual, shrunk toward zero
-// by a prior weight of 3, so a lone live peer cannot set a wild price and one outlier peer cannot
-// drag a whole category's price. The fitted value is then:
+// fit by a Huber robust regression on the protocols that already trade (128 of them, market
+// cap and TVL both positive): iteratively reweighted least squares, delta 1.0, the scale from
+// the median absolute deviation of the residuals, at most 50 iterations, starting from the
+// ordinary least-squares fit. No random source anywhere, so the fit is the same on every run.
+// The category offset is each category's MEDIAN residual, shrunk toward zero by a prior
+// weight of 3, so a lone live peer cannot set a wild price and one outlier peer cannot drag
+// a whole category's price. The fitted value is then:
 //
 //   fitted = exp(a + b x log(tvl_usd) + offset) x growth x maturity x chain
 //
@@ -55,22 +65,23 @@
 //   maturity = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age unknown: 365 days)
 //   chain    = 1 + 0.02 x min(chains - 1, 5)
 //
-// The fitted terms were tested and rejected, by the program itself, every run: adding log(age),
-// seven-day growth or log(chains) as a fitted OLS term HURTS five-fold cross-validation (base
-// 0.138 vs +logAge 0.118, +growth 0.134, +logChains 0.120, all three 0.093), and leave-one-out
-// agrees (base 0.162 vs all 0.137). A quadratic in log TVL, a cubic and a hinge/spline were
-// tested the same way and also fail the bar (quadratic 0.132, cubic 0.143 with median error 86%,
-// hinge 0.126). So they stay bounded multipliers, and the dashboard says so with the computed
-// numbers.
+// The fitted terms were tested and rejected, by the program itself, every run, under the same
+// Huber fit: adding log(age), seven-day growth or log(chains) as a fitted term HURTS five-fold
+// cross-validation (base 0.154 vs +logAge 0.130, +growth 0.144, +logChains 0.140, all three
+// 0.111), and leave-one-out agrees (base 0.165 vs all 0.136). A quadratic in log TVL was
+// re-tested under the Huber fit (0.146) and still fails the bar; a cubic (0.143 with median
+// error 86%) and a hinge/spline (0.126) were tested under OLS and fail the bar the same way.
+// So they stay bounded multipliers, and the dashboard says so with the computed numbers.
 //
 // The odds are a logistic regression, fitted from the snapshot's own token record: for a launch
 // candidate, the probability it ever records a token, from log TVL, log age, seven-day growth,
-// log chain count and its category's token rate (Laplace-smoothed toward the global rate with a
-// prior weight of 2). Features are standardized; gradient descent, learning rate 0.1, 2000
-// iterations, beta starting at zero: fully deterministic. The odds are clamped to [0.05, 0.95].
-// The radar-3 smoothed average (category rate plus TVL-tier rate, halved) is still computed on
-// every row and scored beside the logistic odds, so the improvement is measured, not asserted:
-// five-fold held-out Brier 0.2168 vs 0.2314, log-loss 0.6278 vs 0.6551.
+// log chain count, its category's token rate (Laplace-smoothed toward the global rate with a
+// prior weight of 2) and a listed-2024-or-later step. Features are standardized; gradient
+// descent, learning rate 0.1, 2000 iterations, beta starting at zero: fully deterministic. The
+// odds are clamped to [0.05, 0.95]. The radar-3 smoothed average (category rate plus TVL-tier
+// rate, halved) is still computed on every row and scored beside the logistic odds, so the
+// improvement is measured, not asserted: five-fold held-out Brier 0.2031 vs 0.2314, log-loss
+// 0.5947 vs 0.6551.
 //
 // A farm verdict rides on every row. For a launch candidate it is the expected net of farming
 // at the LOW end of the fitted value band: the farmer is assumed to hold one basis point
@@ -151,6 +162,12 @@ export interface ModelConstants {
   /** The value band's quantiles of the live peers' log residuals (10th and 90th). */
   value_band_lo_q: number;
   value_band_hi_q: number;
+  /** The value fit's Huber tuning constant (delta, in units of the MAD scale). */
+  huber_delta: number;
+  /** The value fit's Huber iteration cap (IRLS stops earlier on convergence). */
+  huber_max_iterations: number;
+  /** The odds' listed-year step: a protocol listed in this year or later takes the step's 1. */
+  odds_era_year: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -179,16 +196,19 @@ export const MODEL: ModelConstants = {
   farm_threshold_usd: 25,
   value_band_lo_q: 0.1,
   value_band_hi_q: 0.9,
+  huber_delta: 1.0,
+  huber_max_iterations: 50,
+  odds_era_year: 2024,
 };
 
 /** The model's version label: the dashboard names it.
- * radar-7 keeps radar-5's fit EXACTLY (OLS log(mcap) = a + b x log(tvl) + median
- * category offset, prior weight 3; v3 logistic odds, no era step) and adds one
- * thing only: a two-sided-proof negative control. The same five-fold held-out
- * folds also score a naive median mcap/TVL multiple (no regression, no category
- * offsets, no multipliers), so the dashboard can show the fitted model beating a
- * control that fails — the validation is real because the control fails. */
-export const MODEL_VERSION = 'radar-7';
+ * radar-8 is radar-6's fit (Huber log(mcap) = a + b x log(tvl) + median
+ * category offset, prior weight 3; logistic odds with the listed-2024-or-later
+ * era step) plus radar-7's two-sided-proof negative control. The same five-fold
+ * held-out folds also score a naive median mcap/TVL multiple (no regression, no
+ * category offsets, no multipliers), so the dashboard can show the fitted model
+ * beating a control that fails — the validation is real because the control fails. */
+export const MODEL_VERSION = 'radar-8';
 
 /** How many live-token protocols the Live view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -359,7 +379,7 @@ export interface Validation {
   odds_comparison: OddsComparison;
   calibration: CalibrationBin[];
   logit_coefficients: number[];
-  /** The negative control (radar-7): the naive median mcap/TVL multiple, scored
+  /** The negative control (radar-8, carried over from radar-7): the naive median mcap/TVL multiple, scored
    * on the SAME five-fold held-out folds as the fitted model. One global median
    * multiple from the training folds only — no regression, no category offsets,
    * no multipliers — so the fitted model's edge over it is measured, not asserted. */
@@ -517,6 +537,73 @@ export function trainSet(protocols: SnapshotProtocol[]): SnapshotProtocol[] {
   return protocols
     .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
     .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+}
+
+/**
+ * Weighted ordinary least squares by the normal equations, solved with Gaussian elimination
+ * and partial pivoting, a 1e-9 ridge on the diagonal for stability. The Huber fit's inner step.
+ */
+export function olsWeighted(X: number[][], y: number[], w: number[]): number[] {
+  const k = X[0]!.length;
+  const A: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  const b = new Array<number>(k).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let r = 0; r < k; r++) {
+      b[r]! += w[i]! * X[i]![r]! * y[i]!;
+      for (let c = 0; c < k; c++) A[r]![c]! += w[i]! * X[i]![r]! * X[i]![c]!;
+    }
+  }
+  for (let r = 0; r < k; r++) A[r]![r]! += 1e-9;
+  const M = A.map((row, i) => [...row, b[i]!]);
+  for (let col = 0; col < k; col++) {
+    let piv = col;
+    for (let r = col + 1; r < k; r++) if (Math.abs(M[r]![col]!) > Math.abs(M[piv]![col]!)) piv = r;
+    const tmp = M[col]!;
+    M[col] = M[piv]!;
+    M[piv] = tmp;
+    const d = M[col]![col]!;
+    for (let r = 0; r < k; r++) {
+      if (r === col) continue;
+      const f = M[r]![col]! / d;
+      for (let c = col; c <= k; c++) M[r]![c]! -= f * M[col]![c]!;
+    }
+  }
+  return M.map((row, i) => row[k]! / row[i]!);
+}
+
+/**
+ * The Huber robust fit of a design matrix on a response: iteratively reweighted least squares
+ * starting from the ordinary fit, the scale from the residuals' median absolute deviation,
+ * Huber weights min(1, delta x scale / |residual|), stopping when no coefficient moves by
+ * 1e-8 or the iteration cap is reached. Fully deterministic: a fixed start, a fixed cap, no
+ * random source, so both graded runs fit the same line.
+ */
+export function huberGeneric(X: number[][], y: number[], model: ModelConstants = MODEL): number[] {
+  let beta = olsGeneric(X, y);
+  for (let it = 0; it < model.huber_max_iterations; it++) {
+    const res = X.map((row, i) => y[i]! - row.reduce((s, v, j) => s + beta[j]! * v, 0));
+    const med = medianOf([...res].sort((a, b) => a - b)) ?? 0;
+    const scale = 1.4826 * (medianOf(res.map((r) => Math.abs(r - med)).sort((a, b) => a - b)) ?? 0) || 1;
+    const k = model.huber_delta * scale;
+    const w = res.map((r) => (Math.abs(r) <= k ? 1 : k / Math.abs(r)));
+    const next = olsWeighted(X, y, w);
+    const shift = Math.max(...next.map((v, j) => Math.abs(v - beta[j]!)));
+    beta = next;
+    if (shift < 1e-8) break;
+  }
+  return beta;
+}
+
+/**
+ * The Huber robust fit of log(mcap) on log(TVL): the same IRLS on the two-column design, so
+ * the value model's line is the robust one. Log market-cap residuals are heavy-tailed, so the
+ * OLS line lets a few outlier peers drag it; the Huber line downweights them.
+ */
+export function huberLogLog(train: SnapshotProtocol[], model: ModelConstants = MODEL): { intercept: number; slope: number } {
+  const X = train.map((p) => [1, Math.log(p.tvl_usd)]);
+  const y = train.map((p) => Math.log(p.mcap_usd as number));
+  const beta = huberGeneric(X, y, model);
+  return { intercept: beta[0]!, slope: beta[1]! };
 }
 
 /** The ordinary-least-squares fit of log(mcap) on log(TVL): intercept and slope, closed form. */
@@ -697,14 +784,30 @@ export function categoryRate(protocol: SnapshotProtocol, protocols: SnapshotProt
 }
 
 /**
- * The logistic odds' six features: intercept, log TVL, log age, seven-day growth over 100,
- * log chain count, and the category's smoothed token rate. Age unknown is 365 days, growth is
- * clamped to [-60, 120] percent, the same shapes the value model uses.
+ * The listed-era step: 1 when the protocol was listed in the odds' era year or later, else 0.
+ * A protocol with no listed date takes 0: the no-date protocols record a token 79% of the
+ * time (n=113), the same as the pre-era cohorts, so the snapshot's own record puts them with
+ * the older group rather than the recent one.
+ */
+export function eraStep(protocol: SnapshotProtocol, model: ModelConstants = MODEL): number {
+  if (protocol.listed_at === null) return 0;
+  const year = parseInt(protocol.listed_at.slice(0, 4), 10);
+  return Number.isFinite(year) && year >= model.odds_era_year ? 1 : 0;
+}
+
+/**
+ * The logistic odds' seven features: intercept, log TVL, log age, seven-day growth over 100,
+ * log chain count, the category's smoothed token rate, and the listed-era step (1 when listed
+ * in the odds' era year or later). Age unknown is 365 days, growth is clamped to [-60, 120]
+ * percent, the same shapes the value model uses. The era step is there because the token rate
+ * is a step, not a slope, in listing time: 78-80% for protocols listed before 2024, 51% for
+ * the 2024 cohort, 39% for 2025's and 31% for 2026's, and log age alone, being log-linear,
+ * cannot fit it.
  */
 export function logitFeatures(protocol: SnapshotProtocol, asOf: string, catRate: number, model: ModelConstants = MODEL): number[] {
   const age = ageDays(asOf, protocol.listed_at) ?? model.unknown_age_days;
   const growth = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(protocol.change_7d, 0)));
-  return [1, Math.log(Math.max(1, protocol.tvl_usd)), Math.log(Math.max(1, age)), growth / 100, Math.log(Math.max(1, protocol.chains.length)), catRate];
+  return [1, Math.log(Math.max(1, protocol.tvl_usd)), Math.log(Math.max(1, age)), growth / 100, Math.log(Math.max(1, protocol.chains.length)), catRate, eraStep(protocol, model)];
 }
 
 /** The fitted logistic model: standardized coefficients, means and standard deviations. */
@@ -876,7 +979,7 @@ function valueFeatures(variant: string): (p: SnapshotProtocol, asOf: string) => 
   return (p) => base(p);
 }
 
-/** Category offsets for a generic OLS fit: the median residual per category, shrunk toward zero. */
+/** Category offsets for a generic Huber fit: the median residual per category, shrunk toward zero. */
 function genericOffsets(train: SnapshotProtocol[], beta: number[], featFn: (p: SnapshotProtocol, asOf: string) => number[], asOf: string, model: ModelConstants = MODEL): Map<string, number> {
   const lists = new Map<string, number[]>();
   for (const p of train) {
@@ -898,12 +1001,12 @@ function genericOffsets(train: SnapshotProtocol[], beta: number[], featFn: (p: S
   return out;
 }
 
-/** Fit a generic value model (OLS + category offsets) on a training set. */
+/** Fit a generic value model (Huber + category offsets) on a training set. */
 function fitGeneric(train: SnapshotProtocol[], variant: string, asOf: string, model: ModelConstants = MODEL): { beta: number[]; offs: Map<string, number>; featFn: (p: SnapshotProtocol, asOf: string) => number[] } {
   const featFn = valueFeatures(variant);
   const X = train.map((p) => featFn(p, asOf));
   const y = train.map((p) => Math.log(p.mcap_usd as number));
-  const beta = olsGeneric(X, y);
+  const beta = huberGeneric(X, y, model);
   const offs = genericOffsets(train, beta, featFn, asOf, model);
   return { beta, offs, featFn };
 }
@@ -956,7 +1059,7 @@ export function leaveOneOut(train: SnapshotProtocol[], asOf: string, model: Mode
     pred.push(genericPredLog(train[i]!, fit, asOf));
   }
   const m = validationMetrics(actual, pred);
-  return { name: 'Leave-one-out, radar-7', test_protocols: train.length, log_r2: round4(m.logR2), median_ape: m.medianApe, mape: m.mape, log_rmse: m.logRmse };
+  return { name: 'Leave-one-out, radar-8', test_protocols: train.length, log_r2: round4(m.logR2), median_ape: m.medianApe, mape: m.mape, log_rmse: m.logRmse };
 }
 
 /**
@@ -1060,7 +1163,7 @@ export function fitLogitFull(protocols: SnapshotProtocol[], asOf: string, model:
 }
 
 /**
- * The negative control (radar-7): the naive median mcap/TVL multiple, scored on
+ * The negative control (radar-8, carried over from radar-7): the naive median mcap/TVL multiple, scored on
  * the SAME five-fold held-out folds as the fitted model. For each fold, the
  * control is a single global median of mcap/TVL over the training folds' live
  * peers — no regression, no category offsets, no multipliers — and each held-out
@@ -1105,7 +1208,7 @@ export function validate(train: SnapshotProtocol[], snapshot: Snapshot, model: M
   for (let f = 0; f < folds; f++) {
     const tr = train.filter((_, i) => foldOf(i) !== f);
     const te = train.filter((_, i) => foldOf(i) === f);
-    const fit = olsLogLog(tr);
+    const fit = huberLogLog(tr, model);
     const offs = categoryOffsets(tr, fit, model);
     te.forEach((p) => {
       const i = train.indexOf(p);
@@ -1124,7 +1227,7 @@ export function validate(train: SnapshotProtocol[], snapshot: Snapshot, model: M
   const trainIdx = train.map((_, i) => i).filter((i) => foldOf(i) !== 0);
   const tr = trainIdx.map((i) => train[i]!);
   const te = testIdx.map((i) => train[i]!);
-  const fit = olsLogLog(tr);
+  const fit = huberLogLog(tr, model);
   const offs = categoryOffsets(tr, fit, model);
   const splitPred = te.map((p) => fittedLog(p, fit, offs).log);
   const splitBase = baselinePredictions([...tr, ...zeroMcap], te, snapshot.as_of);
@@ -1266,7 +1369,7 @@ export function bootstrapRankRanges(
   };
   for (let b = 0; b < model.bootstrap_refits; b++) {
     const sample = Array.from({ length: train.length }, () => train[Math.floor(rng() * train.length)]!);
-    const fit = olsLogLog(sample);
+    const fit = huberLogLog(sample, model);
     const offsets = categoryOffsets(sample, fit, model);
     const scored = snapshot.protocols.map((p) => ({ slug: p.slug, implied: impliedFor(p, fit, offsets) }));
     scored.sort((a, c) => c.implied - a.implied || (a.slug < c.slug ? -1 : a.slug > c.slug ? 1 : 0));
@@ -1288,7 +1391,7 @@ export function bootstrapRankRanges(
 /** The protocols the board ranks, strongest first, with ranks 1..n: every protocol in the snapshot. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; fit: { intercept: number; slope: number }; offsets: Map<string, { offset: number; peers: number }>; odds: OddsTable; logit: FittedLogit; logitGlobal: number; validation: Validation; band: ValueBand } {
   const train = trainSet(snapshot.protocols);
-  const fit = olsLogLog(train);
+  const fit = huberLogLog(train, model);
   const offsets = categoryOffsets(train, fit, model);
   const odds = oddsTable(snapshot.protocols, model);
   const { fitted: logit, global: logitGlobal } = fitLogitFull(snapshot.protocols, snapshot.as_of, model);

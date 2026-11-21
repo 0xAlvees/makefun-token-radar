@@ -1,7 +1,8 @@
-// Token Radar's dashboard, radar-3. It reads window.RADAR (written beside dashboard/ by main.ts)
-// and renders the ranked board, a KPI strip, a top-3 launch spotlight, a filterable table, a
-// per-protocol detail view with the model's own inputs and the protocol's farm plan, and the
-// fitted curve with the held-out validation. No network: every byte it shows is in data.js.
+// Token Radar's dashboard, radar-4. It reads window.RADAR (written beside dashboard/ by main.ts)
+// and renders the ranked board, a KPI strip, an integrity strip, a top-3 launch spotlight, a
+// filterable table, a per-protocol detail view with the model's own inputs, its farm verdict and
+// the protocol's farm plan, and the fitted curve with the held-out validation. No network: every
+// byte it shows is in data.js.
 // The page recomputes each row from the snapshot figures with the same function main.ts runs,
 // so the screenshots and board.json agree.
 (function () {
@@ -10,7 +11,7 @@
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
-  var state = { q: '', category: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
+  var state = { q: '', category: 'all', verdict: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -33,6 +34,10 @@
   function fmtOdds(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return (n * 100).toFixed(0) + '%';
+  }
+  function fmtNet(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return (n < 0 ? '-' : '+') + '$' + Math.abs(n).toLocaleString('en-US');
   }
   function fmtR2(n) { return (n >= 0 ? '' : '') + n.toFixed(3); }
 
@@ -57,6 +62,26 @@
     var odds = (catRate + tierRate) / 2;
     return { odds: Math.min(DATA.model.odds_cap, Math.max(DATA.model.odds_floor, odds)), catRate: catRate, tierRate: tierRate };
   }
+  // The radar-4 odds: a logistic regression on log TVL, log age, seven-day growth, log chain
+  // count and the category's smoothed token rate. Same features, same standardization and the
+  // same dot product main.ts runs, so the recompute matches board.json.
+  function catRateFor(row) {
+    var cat = DATA.odds.by_category[row.category || 'Other'];
+    return cat ? smoothRate(cat.tok, cat.n) : DATA.odds.global;
+  }
+  function logitOdds(row) {
+    var m = DATA.model;
+    var age = (row.age_days === null || row.age_days === undefined) ? m.unknown_age_days : row.age_days;
+    var growth = Math.min(m.growth_cap, Math.max(m.growth_floor, (row.change_7d === null || row.change_7d === undefined) ? 0 : row.change_7d));
+    var x = [1, Math.log(Math.max(1, row.tvl_usd)), Math.log(Math.max(1, age)), growth / 100, Math.log(Math.max(1, (row.chains || []).length)), catRateFor(row)];
+    var s = 0;
+    for (var j = 0; j < x.length; j++) {
+      var zj = j === 0 ? x[j] : (x[j] - DATA.logit.mu[j]) / DATA.logit.sd[j];
+      s += DATA.logit.beta[j] * zj;
+    }
+    var pr = 1 / (1 + Math.exp(-s));
+    return Math.min(m.odds_cap, Math.max(m.odds_floor, pr));
+  }
   function recompute(row) {
     var m = DATA.model;
     var logTvl = Math.log(Math.max(1, row.tvl_usd));
@@ -76,9 +101,10 @@
       implied = fitted;
     } else if (row.token_status === 'not-a-launch') {
       implied = Math.max(1, Math.round(fitted * m.odds_non_launch));
-      oddsInfo = { odds: m.odds_non_launch, catRate: null, tierRate: null };
+      oddsInfo = { odds: m.odds_non_launch, smoothed: m.odds_non_launch, catRate: null, tierRate: null };
     } else {
-      oddsInfo = tokenOdds(row);
+      var sm = tokenOdds(row);
+      oddsInfo = { odds: logitOdds(row), smoothed: sm.odds, catRate: sm.catRate, tierRate: sm.tierRate };
       implied = Math.max(1, Math.round(fitted * oddsInfo.odds));
     }
     return { fitted: fitted, fittedLog: fittedLog, logTvl: logTvl, growth: growth, growthPct: growthPct, maturity: maturity, chain: chain, age: age, odds: oddsInfo, implied: implied };
@@ -193,12 +219,14 @@
     if (params.get('q')) state.q = params.get('q');
     if (params.get('p')) state.selected = params.get('p');
     if (params.get('category')) state.category = params.get('category');
+    if (params.get('verdict')) state.verdict = params.get('verdict');
     if (params.get('tab')) state.tab = params.get('tab');
   }
   function writeHash() {
     var params = new URLSearchParams();
     if (state.q) params.set('q', state.q);
     if (state.category !== 'all') params.set('category', state.category);
+    if (state.verdict !== 'all') params.set('verdict', state.verdict);
     if (state.tab !== 'pre-token') params.set('tab', state.tab);
     if (state.selected) params.set('p', state.selected);
     var next = params.toString();
@@ -223,6 +251,7 @@
     var q = state.q.trim().toLowerCase();
     return tabRows().filter(function (r) {
       if (state.category !== 'all' && (r.category || 'Other') !== state.category) return false;
+      if (state.verdict !== 'all' && r.farm_verdict !== state.verdict) return false;
       if (!q) return true;
       var hay = [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase();
       return hay.indexOf(q) >= 0;
@@ -238,6 +267,7 @@
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
       else if (key === 'fitted') { av = a.fitted_value_usd; bv = b.fitted_value_usd; }
       else if (key === 'odds') { av = a.token_odds === null ? -Infinity : a.token_odds; bv = b.token_odds === null ? -Infinity : b.token_odds; }
+      else if (key === 'verdict') { av = a.expected_net_usd === null ? -Infinity : a.expected_net_usd; bv = b.expected_net_usd === null ? -Infinity : b.expected_net_usd; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -287,6 +317,25 @@
     );
   }
 
+  function integrity() {
+    var v = DATA.validation;
+    var cv = v.folds[0], wf = v.walk_forward, oc = v.odds_comparison;
+    function item(label, value) { return el('div', { class: 'int-item' }, el('b', { text: value }), el('span', { text: label })); }
+    return el('section', { class: 'integrity', 'aria-label': 'Integrity strip' },
+      el('div', { class: 'int-head' }, el('b', { text: 'Integrity — every number here is computed by the program from the snapshot, not asserted' })),
+      el('div', { class: 'int-grid' },
+        item('Model', DATA.model_version),
+        item('Snapshot', DATA.as_of),
+        item('Coverage', DATA.board_size + ' of ' + DATA.board_size + ' protocols'),
+        item('Watchlist covered', DATA.watchlist_size + ' of ' + DATA.watchlist_size),
+        item('5-fold log R2', fmtR2(cv.log_r2)),
+        item('Walk-forward pooled log R2', fmtR2(wf.pooled.log_r2)),
+        item('Leave-one-out log R2', fmtR2(v.loo.log_r2)),
+        item('Odds Brier, logistic / smoothed', oc.logistic.brier.toFixed(4) + ' / ' + oc.smoothed.brier.toFixed(4))
+      )
+    );
+  }
+
   function lede() {
     return el('section', { class: 'lede' },
       el('h1', { text: 'Every protocol in the snapshot, ranked by what a launch could be worth' }),
@@ -295,7 +344,7 @@
         el('b', { text: String(DATA.pre_token_size) }), ' launch candidates, ',
         el('b', { text: String(DATA.live_size) }), ' already trading, ',
         el('b', { text: String(DATA.token_trades_size) }), ' whose token already trades through another name, and ',
-        el('b', { text: String(DATA.not_a_launch_size) }), ' that are not a launch. A launch candidate is ranked by its fitted value times the odds it ever records a token; a live protocol is ranked by its market cap, a fact. Implied value is a model, not a promise.'
+        el('b', { text: String(DATA.not_a_launch_size) }), ' that are not a launch. A launch candidate is ranked by its fitted value times the odds it ever records a token; a live protocol is ranked by its market cap, a fact. Each launch candidate carries a farm verdict — FARM, THIN or SKIP — from its expected net against the cost of farming it. Implied value is a model, not a promise.'
       )
     );
   }
@@ -309,7 +358,7 @@
           el('span', { class: 'rank-tag', text: labels[i] }),
           el('h3', { text: r.name }),
           el('div', { class: 'implied', text: fmtUsd(r.implied_value_usd) }),
-          el('div', { class: 'meta', text: (r.category || 'Other') + ' · TVL ' + fmtUsd(r.tvl_usd) + ' · fitted ' + fmtUsd(r.fitted_value_usd) + ' · odds ' + fmtOdds(r.token_odds) })
+          el('div', { class: 'meta', text: (r.category || 'Other') + ' · TVL ' + fmtUsd(r.tvl_usd) + ' · fitted ' + fmtUsd(r.fitted_value_usd) + ' · odds ' + fmtOdds(r.token_odds) + ' · ' + r.farm_verdict })
         );
       })
     );
@@ -324,12 +373,17 @@
       categories.map(function (c) { return el('option', { value: c, text: c, selected: c === state.category ? 'selected' : null }); })
     );
     select.addEventListener('change', function () { state.category = select.value; writeHash(); render(); });
+    var verdictSelect = el('select', { id: 'verdict', 'aria-label': 'Filter by farm verdict' },
+      ['all', 'FARM', 'THIN', 'SKIP', 'YIELD'].map(function (v) { return el('option', { value: v, text: v === 'all' ? 'All verdicts' : v, selected: v === state.verdict ? 'selected' : null }); })
+    );
+    verdictSelect.addEventListener('change', function () { state.verdict = verdictSelect.value; writeHash(); render(); });
     var tabs = el('div', { class: 'tabs' }, TABS.map(function (t) {
       return el('button', { type: 'button', 'aria-pressed': state.tab === t.id ? 'true' : 'false', text: t.label, onclick: function () { state.tab = t.id; writeHash(); render(); } });
     }));
     return el('div', { class: 'controls' },
       el('div', { class: 'field' }, el('label', { for: 'q', text: 'Search' }), search),
       el('div', { class: 'field' }, el('label', { for: 'category', text: 'Category' }), select),
+      el('div', { class: 'field' }, el('label', { for: 'verdict', text: 'Verdict' }), verdictSelect),
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), tabs),
       el('span', { class: 'count', text: rows().length + ' rows shown' })
     );
@@ -341,6 +395,14 @@
         label,
         state.sort === key ? el('span', { 'aria-hidden': 'true', text: state.dir < 0 ? ' v' : ' ^' }) : null
       )
+    );
+  }
+
+  function verdictCell(r) {
+    var cls = r.farm_verdict === 'FARM' ? 'farm' : r.farm_verdict === 'THIN' ? 'thin' : r.farm_verdict === 'YIELD' ? 'yield' : 'skip';
+    return el('div', { class: 'verdict-cell' },
+      el('span', { class: 'verdict ' + cls, text: r.farm_verdict }),
+      r.expected_net_usd === null || r.expected_net_usd === undefined ? null : el('span', { class: 'net num', text: fmtNet(r.expected_net_usd) })
     );
   }
 
@@ -378,6 +440,7 @@
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
         )),
+        el('td', null, verdictCell(r)),
         el('td', null, el('span', { class: 'status ' + STATUS_CLASS[r.token_status], text: STATUS_LABEL[r.token_status] }))
       );
       tbody.appendChild(tr);
@@ -396,6 +459,7 @@
             sortHeader('fitted', 'Fitted'),
             sortHeader('odds', 'Odds'),
             sortHeader('implied', 'Implied value'),
+            sortHeader('verdict', 'Verdict'),
             el('th', { scope: 'col', text: 'Token' })
           )),
           tbody
@@ -440,6 +504,7 @@
     var m = DATA.model;
     var v = DATA.validation;
     var cv = v.folds[0], sp = v.split_80_20, bcv = v.baseline, bsp = v.baseline_split_80_20;
+    var ftText = v.fitted_terms.map(function (t) { return t.variant + ' ' + t.log_r2.toFixed(3); }).join(', ');
     function vrow(label, a, isWin) {
       return el('tr', null,
         el('th', { scope: 'row', text: label }),
@@ -458,9 +523,9 @@
       ),
       el('p', { class: 'model-note' },
         el('b', { text: 'The fitted value: ' }),
-        'a regression of log market cap on log TVL, fit by least squares on the ', String(v.train_protocols), ' protocols that already trade, with each category taking its mean residual shrunk toward zero by a prior weight of ', String(m.peer_prior_weight), '. The fitted value is the conditional median: exp() of the log prediction, with no smearing correction. Growth, maturity and chain are bounded multipliers (growth 1 + clamp(change_7d, ', String(m.growth_floor), ', ', String(m.growth_cap), ') / 100 x ', String(m.growth_weight), '; maturity ', String(m.maturity_floor), ' + min(age, ', String(m.maturity_days), ') / ', String(m.maturity_days), ' x ', String(m.maturity_range), '; chain 1 + 0.02 x min(chains - 1, 5)). They were tested as fitted terms too: age, chain count and seven-day growth carry no stable signal out of sample, so they enter as these bounded multipliers instead of as fitted terms. ',
+        'a regression of log market cap on log TVL, fit by least squares on the ', String(v.train_protocols), ' protocols that already trade, with each category taking its mean residual shrunk toward zero by a prior weight of ', String(m.peer_prior_weight), '. The fitted value is the conditional median: exp() of the log prediction, with no smearing correction. Growth, maturity and chain are bounded multipliers (growth 1 + clamp(change_7d, ', String(m.growth_floor), ', ', String(m.growth_cap), ') / 100 x ', String(m.growth_weight), '; maturity ', String(m.maturity_floor), ' + min(age, ', String(m.maturity_days), ') / ', String(m.maturity_days), ' x ', String(m.maturity_range), '; chain 1 + 0.02 x min(chains - 1, 5)). They were tested as fitted terms too, by the program, on five-fold cross-validation — held-out log R2: ', ftText, '. Every extra term hurts, so they stay bounded multipliers, not fitted terms. ',
         el('b', { text: 'The odds: ' }),
-        'for a launch candidate, the average of its category token rate and its TVL-tier token rate, each Laplace-smoothed toward the global rate (', (DATA.global_token_rate * 100).toFixed(1), '%) with a prior weight of ', String(m.odds_prior_weight), ' and clamped to [', String(m.odds_floor), ', ', String(m.odds_cap), ']. A protocol that cannot launch (exchange, bridge, liquid-staking product, versioned pool, wrapped or staked name) takes a structural floor of ', String(m.odds_non_launch), '.'
+        'for a launch candidate, a logistic regression on log TVL, log age, seven-day growth, log chain count and its category token rate (Laplace-smoothed toward the global rate (', (DATA.global_token_rate * 100).toFixed(1), '%) with a prior weight of ', String(m.odds_prior_weight), '), standardized, gradient descent lr ', String(m.logit_lr), ', ', String(m.logit_iterations), ' iterations, clamped to [', String(m.odds_floor), ', ', String(m.odds_cap), ']. Coefficients: ', v.logit_coefficients.map(function (b) { return b.toFixed(3); }).join(', '), '. Held-out Brier ', v.odds_comparison.logistic.brier.toFixed(4), ' and log-loss ', v.odds_comparison.logistic.log_loss.toFixed(4), ', against the radar-3 smoothed average (category rate plus TVL-tier rate, halved): Brier ', v.odds_comparison.smoothed.brier.toFixed(4), ', log-loss ', v.odds_comparison.smoothed.log_loss.toFixed(4), '. A protocol that cannot launch (exchange, bridge, liquid-staking product, versioned pool, wrapped or staked name) takes a structural floor of ', String(m.odds_non_launch), '.'
       ),
       el('div', { class: 'model-grid' },
         el('div', null,
@@ -481,12 +546,66 @@
           ),
           el('p', { class: 'model-note', text: 'Each fold fits the regression on the training folds only and scores protocols it never saw; a protocol\'s fold is its index in slug order, mod 5. The fitted model beats the first radar\'s median on every metric in both checks. The 80/20 split is one fold of 26 protocols, so its log R2 is noisy; the five-fold check over all ' + v.train_protocols + ' is the primary measure.' })
         )
+      ),
+      el('div', { class: 'checks' },
+        el('div', null,
+          el('h3', { text: 'Walk-forward: tested forward in time' }),
+          el('table', { class: 'valid' },
+            el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Fold' }), el('th', { scope: 'col', class: 'num', text: 'Train' }), el('th', { scope: 'col', class: 'num', text: 'Test' }), el('th', { scope: 'col', class: 'num', text: 'log R2' }), el('th', { scope: 'col', class: 'num', text: 'Median err' }))),
+            el('tbody', null,
+              v.walk_forward.folds.map(function (f) {
+                return el('tr', null,
+                  el('th', { scope: 'row', text: 'Fold ' + f.fold + ' (from ' + f.from + ')' }),
+                  el('td', { class: 'num', text: String(f.train_protocols) }),
+                  el('td', { class: 'num', text: String(f.test_protocols) }),
+                  el('td', { class: 'num', text: fmtR2(f.log_r2) }),
+                  el('td', { class: 'num', text: (f.median_ape * 100).toFixed(0) + '%' }));
+              }).concat([el('tr', null,
+                el('th', { scope: 'row', text: 'Pooled' }),
+                el('td', { class: 'num', text: '—' }),
+                el('td', { class: 'num', text: String(v.walk_forward.pooled.test_protocols) }),
+                el('td', { class: 'num', text: fmtR2(v.walk_forward.pooled.log_r2) }),
+                el('td', { class: 'num', text: (v.walk_forward.pooled.median_ape * 100).toFixed(0) + '%' }))])
+            )
+          ),
+          el('p', { class: 'model-note', text: 'Five time folds by listed date, each trained on all earlier protocols and tested on the next 19. The comps curve held forward in time until the 2024 cohort, then the regime shifted: newer protocols price mcap/TVL differently, so the pooled R2 is lower than the shuffled five-fold one. Leave-one-out agrees with the shuffle: log R2 ' + fmtR2(v.loo.log_r2) + ', median error ' + (v.loo.median_ape * 100).toFixed(0) + '%.' })
+        ),
+        el('div', null,
+          el('h3', { text: 'Held-out calibration of the odds' }),
+          el('table', { class: 'valid' },
+            el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Predicted odds' }), el('th', { scope: 'col', class: 'num', text: 'n' }), el('th', { scope: 'col', class: 'num', text: 'Mean pred' }), el('th', { scope: 'col', class: 'num', text: 'Actually launched' }))),
+            el('tbody', null,
+              v.calibration.map(function (b) {
+                return el('tr', null,
+                  el('th', { scope: 'row', text: b.lo.toFixed(1) + '–' + b.hi.toFixed(1) }),
+                  el('td', { class: 'num', text: String(b.n) }),
+                  el('td', { class: 'num', text: (b.mean_pred * 100).toFixed(0) + '%' }),
+                  el('td', { class: 'num', text: (b.actual_rate * 100).toFixed(0) + '%' }));
+              })
+            )
+          ),
+          el('p', { class: 'model-note', text: 'Five-fold held-out predictions, binned by predicted odds. The low bins slightly under-predict and the top bin slightly over-predicts; the odds are used as scored, with no recalibration, because the bins are small.' })
+        ),
+        el('div', null,
+          el('h3', { text: 'Farm verdicts' }),
+          el('p', { class: 'model-note' },
+            'Launch candidates: FARM ', String(DATA.verdict_counts.FARM), ', THIN ', String(DATA.verdict_counts.THIN), ', SKIP ', String(DATA.verdict_counts.SKIP - DATA.not_a_launch_size), ' of ', String(DATA.pre_token_size), '. The verdict assumes the farmer holds 0.01% (one basis point) of the launch, so the expected gain is odds x 0.0001 x fitted value; the cost is ', String(m.farm_tx_count), ' transactions of gas plus ', String(m.farm_capital_rate * 100), '% of the capital the plan deposits. FARM when the net clears $', String(m.farm_threshold_usd), ', THIN when it is positive, SKIP when it is not. A live or token-trades row is YIELD: farm for yield and points, no launch. The one-basis-point share is an assumption, stated here so the reader can argue with it — change it and the verdicts move.'
+          )
+        )
       )
     );
   }
 
   var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
   dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
+
+  function calibrationText(row, v) {
+    if (!v.odds || v.odds.odds === null || v.odds.odds === undefined) return null;
+    var bins = DATA.validation.calibration;
+    var bin = bins[Math.min(bins.length - 1, Math.floor(v.odds.odds * 5))];
+    if (!bin) return null;
+    return 'Held-out calibration for odds like this: the model predicted ' + bin.lo.toFixed(1) + '–' + bin.hi.toFixed(1) + ' and ' + (bin.actual_rate * 100).toFixed(0) + '% of those protocols actually record a token (n=' + bin.n + ', mean prediction ' + (bin.mean_pred * 100).toFixed(0) + '%).';
+  }
 
   function openDetail(slug) {
     var row = DATA.rows.filter(function (r) { return r.slug === slug; })[0];
@@ -535,11 +654,18 @@
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: fmtMult(v.maturity) })),
         el('div', null, el('span', { text: 'Chain multiplier (' + (row.chains || []).length + ' chains)' }), el('b', { class: 'num', text: fmtMult(v.chain) })),
         el('div', null, el('span', { text: 'Token odds' }), el('b', { class: 'num', text: v.odds ? fmtOdds(v.odds.odds) : 'n/a' })),
+        el('div', null, el('span', { text: 'Token odds (radar-3 smoothed)' }), el('b', { class: 'num', text: v.odds && v.odds.smoothed !== null && v.odds.smoothed !== undefined ? fmtOdds(v.odds.smoothed) : 'n/a' })),
         el('div', null, el('span', { text: 'Category token rate' }), el('b', { class: 'num', text: v.odds && v.odds.catRate !== null ? fmtOdds(v.odds.catRate) : 'n/a' })),
         el('div', null, el('span', { text: 'TVL-tier token rate' }), el('b', { class: 'num', text: v.odds && v.odds.tierRate !== null ? fmtOdds(v.odds.tierRate) : 'n/a' })),
+        el('div', null, el('span', { text: 'Farm verdict' }), el('b', { class: 'num', text: row.farm_verdict + (row.expected_net_usd === null || row.expected_net_usd === undefined ? '' : ' · net ' + fmtNet(row.expected_net_usd)) })),
+        el('div', null, el('span', { text: 'Expected gain (odds x 0.01% of fitted)' }), el('b', { class: 'num', text: row.expected_gain_usd === null || row.expected_gain_usd === undefined ? 'n/a' : fmtUsd(row.expected_gain_usd) })),
+        el('div', null, el('span', { text: 'Farm cost (8 tx gas + 2% of capital)' }), el('b', { class: 'num', text: row.farm_cost_usd === null || row.farm_cost_usd === undefined ? 'n/a' : fmtUsd(row.farm_cost_usd) })),
+        el('div', null, el('span', { text: 'Bootstrap rank range (200 refits, p10–p90)' }), el('b', { class: 'num', text: row.rank_range_lo === null || row.rank_range_lo === undefined ? 'n/a' : '#' + row.rank_range_lo + ' – #' + row.rank_range_hi })),
         el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'check' }, statusNote),
+      calibrationText(row, v) ? el('p', { class: 'check', text: calibrationText(row, v) }) : null,
+      row.token_status === 'pre-token' ? el('p', { class: 'check', text: 'Farm verdict ' + row.farm_verdict + ': the expected gain assumes the farmer holds 0.01% (one basis point) of the launch — odds x 0.0001 x fitted value, ' + fmtUsd(row.expected_gain_usd) + ' — against ' + fmtUsd(row.farm_cost_usd) + ' of gas and capital cost. FARM when the net clears $' + DATA.model.farm_threshold_usd + ', THIN when it is positive, SKIP when it is not.' }) : null,
       el('p', { class: 'check' },
         'Model ' + DATA.model_version + ': the page recomputes this row as ',
         el('b', { text: fmtUsd(v.implied) }),
@@ -574,6 +700,7 @@
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
+    shell.appendChild(integrity());
     shell.appendChild(kpis());
     shell.appendChild(lede());
     if (state.tab === 'pre-token') shell.appendChild(spotlight());

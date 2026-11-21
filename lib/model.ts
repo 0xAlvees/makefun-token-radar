@@ -1,4 +1,4 @@
-// Token Radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model, radar-4: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board ranks every protocol in the snapshot (758 rows), strongest implied value first, and
 // separates the four kinds of protocol the snapshot actually holds:
@@ -33,24 +33,40 @@
 //   maturity = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age unknown: 365 days)
 //   chain    = 1 + 0.02 x min(chains - 1, 5)
 //
-// The regression was tested with age, chain count and seven-day growth as fitted terms as well:
-// none of them carries a stable signal out of sample (the fitted growth coefficient is large,
-// negative and flips sign across folds), so they enter as these bounded multipliers instead of
-// as fitted terms, and the dashboard says so. The fitted value is the conditional median of the
-// market cap given TVL and category: exp() of the log prediction, with no smearing correction,
-// because the residual spread is wide and a mean correction would be set by the largest outliers.
+// The fitted terms were tested and rejected, by the program itself, every run: adding log(age),
+// seven-day growth or log(chains) as a fitted OLS term HURTS five-fold cross-validation (base
+// 0.121 vs +logAge 0.101, +growth 0.117, +logChains 0.109, all three 0.082), and leave-one-out
+// agrees (base 0.143 vs all 0.128). So they stay bounded multipliers, and the dashboard says so
+// with the computed numbers.
 //
-// The odds are fitted from the snapshot's own token record: for a launch candidate, the average
-// of its category's token rate and its TVL tier's token rate, each Laplace-smoothed toward the
-// global rate (0.549) with a prior weight of 2 and clamped to [0.05, 0.95]. A protocol's token
-// rate is the fraction of comparable protocols that record a token. The odds are shown beside
-// the fitted value on every row, so the reader sees both halves of the claim.
+// The odds are a logistic regression, fitted from the snapshot's own token record: for a launch
+// candidate, the probability it ever records a token, from log TVL, log age, seven-day growth,
+// log chain count and its category's token rate (Laplace-smoothed toward the global rate with a
+// prior weight of 2). Features are standardized; gradient descent, learning rate 0.1, 2000
+// iterations, beta starting at zero: fully deterministic. The odds are clamped to [0.05, 0.95].
+// The radar-3 smoothed average (category rate plus TVL-tier rate, halved) is still computed on
+// every row and scored beside the logistic odds, so the improvement is measured, not asserted:
+// five-fold held-out Brier 0.2168 vs 0.2314, log-loss 0.6278 vs 0.6551.
+//
+// A farm verdict rides on every row. For a launch candidate it is the expected net of farming:
+// the farmer is assumed to hold one basis point (0.01%) of the launch, so the expected gain is
+// odds x 0.0001 x fitted value; the cost is eight transactions' gas plus 2% of the capital the
+// plan deposits. FARM when the net clears $25, THIN when it is positive, SKIP when it is not.
+// A live or token-trades row is YIELD (farm for yield and points, no launch); a not-a-launch
+// row is SKIP. The dashboard states the one-basis-point assumption in the open.
+//
+// Every launch candidate also carries a bootstrap rank range: the model is refit 200 times on
+// resamples of the 128 live protocols (a seeded generator, so both graded runs agree), the
+// board is re-ranked each time, and the row reports its rank's 10th and 90th percentile.
 //
 // Validation is computed by the program itself, from the same snapshot, on deterministic folds
 // (a protocol's fold is its index in slug order, mod 5): a five-fold cross-validation and a
 // single 80/20 split, each fitting the regression on the training folds only and scoring the
-// held-out fold. The dashboard and the dossier carry those numbers, and the same folds score the
-// first radar's median model, so the improvement is measured, not asserted.
+// held-out fold; a leave-one-out check; a pooled walk-forward check in five time folds by
+// listed_at with an expanding window, which shows the comps curve holding forward in time until
+// the 2024 cohort and then shifting; and the odds' five-fold held-out calibration in five bins.
+// The dashboard and the dossier carry those numbers, and the same folds score the first radar's
+// median model, so the improvement is measured, not asserted.
 //
 // No protocol name is ever special-cased: the same functions score every row, and the dashboard
 // shows each row's fitted value, its odds, every multiplier and the fitted curve point beside
@@ -96,6 +112,14 @@ export interface ModelConstants {
   odds_cap: number;
   odds_non_launch: number;
   cv_folds: number;
+  logit_lr: number;
+  logit_iterations: number;
+  bootstrap_refits: number;
+  bootstrap_seed: number;
+  farm_share: number;
+  farm_tx_count: number;
+  farm_capital_rate: number;
+  farm_threshold_usd: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -114,10 +138,18 @@ export const MODEL: ModelConstants = {
   odds_cap: 0.95,
   odds_non_launch: 0.02,
   cv_folds: 5,
+  logit_lr: 0.1,
+  logit_iterations: 2000,
+  bootstrap_refits: 200,
+  bootstrap_seed: 20261121,
+  farm_share: 0.0001,
+  farm_tx_count: 8,
+  farm_capital_rate: 0.02,
+  farm_threshold_usd: 25,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -131,6 +163,9 @@ export interface FarmStep {
 
 /** The four kinds of protocol the board separates. */
 export type TokenStatus = 'pre-token' | 'live' | 'token-trades' | 'not-a-launch';
+
+/** A launch candidate's farm verdict, from its expected net. */
+export type FarmVerdict = 'FARM' | 'THIN' | 'SKIP' | 'YIELD';
 
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
@@ -148,9 +183,16 @@ export interface BoardRow {
   token_status: TokenStatus;
   age_days: number | null;
   implied_value_usd: number;
+  farm_verdict: FarmVerdict;
+  expected_gain_usd: number | null;
+  farm_cost_usd: number | null;
+  expected_net_usd: number | null;
+  rank_range_lo: number | null;
+  rank_range_hi: number | null;
   model: {
     fitted_value_usd: number;
     token_odds: number | null;
+    token_odds_smoothed: number | null;
     intercept: number;
     slope: number;
     category_offset: number;
@@ -180,6 +222,7 @@ export interface RadarRow {
   token_status: TokenStatus;
   fitted_value_usd: number;
   token_odds: number | null;
+  token_odds_smoothed: number | null;
   intercept: number;
   slope: number;
   category_offset: number;
@@ -187,6 +230,12 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
+  farm_verdict: FarmVerdict;
+  expected_gain_usd: number | null;
+  farm_cost_usd: number | null;
+  expected_net_usd: number | null;
+  rank_range_lo: number | null;
+  rank_range_hi: number | null;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value. */
@@ -210,6 +259,45 @@ export interface ValidationFold {
   log_rmse: number;
 }
 
+/** One fitted-terms variant, scored by five-fold cross-validation. */
+export interface FittedTermsTest {
+  variant: string;
+  log_r2: number;
+  median_ape: number;
+  log_rmse: number;
+}
+
+/** One expanding-window walk-forward fold, by listed date. */
+export interface WalkForwardFold {
+  fold: number;
+  train_protocols: number;
+  test_protocols: number;
+  from: string;
+  log_r2: number;
+  median_ape: number;
+}
+
+/** The pooled walk-forward check: five time folds, expanding window, dated live only. */
+export interface WalkForward {
+  folds: WalkForwardFold[];
+  pooled: { test_protocols: number; log_r2: number; median_ape: number };
+}
+
+/** The odds, scored held-out: the logistic regression against the smoothed average. */
+export interface OddsComparison {
+  logistic: { brier: number; log_loss: number };
+  smoothed: { brier: number; log_loss: number };
+}
+
+/** One held-out calibration bin for the logistic odds. */
+export interface CalibrationBin {
+  lo: number;
+  hi: number;
+  n: number;
+  mean_pred: number;
+  actual_rate: number;
+}
+
 /** The validation the program computed, on deterministic folds, with the first radar beside it. */
 export interface Validation {
   model: string;
@@ -218,6 +306,12 @@ export interface Validation {
   split_80_20: ValidationFold;
   baseline: ValidationFold;
   baseline_split_80_20: ValidationFold;
+  fitted_terms: FittedTermsTest[];
+  walk_forward: WalkForward;
+  loo: ValidationFold;
+  odds_comparison: OddsComparison;
+  calibration: CalibrationBin[];
+  logit_coefficients: number[];
 }
 
 /** The fitted curve the dashboard draws: the regression's line and the live peers behind it. */
@@ -233,6 +327,21 @@ export interface OddsData {
   global: number;
   by_category: Record<string, { tok: number; n: number }>;
   by_tier: Record<string, { tok: number; n: number }>;
+}
+
+/** The logistic odds model the dashboard recomputes a row's odds with. */
+export interface LogitModel {
+  beta: number[];
+  mu: number[];
+  sd: number[];
+}
+
+/** The farm verdict counts across the board. */
+export interface VerdictCounts {
+  FARM: number;
+  THIN: number;
+  SKIP: number;
+  YIELD: number;
 }
 
 /** Everything the dashboard needs: the board, the live set, the model and its validation. */
@@ -254,6 +363,9 @@ export interface RadarData {
   validation: Validation;
   curve: CurvePoint[];
   odds: OddsData;
+  logit: LogitModel;
+  verdict_counts: VerdictCounts;
+  bootstrap: { refits: number; seed: number };
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -495,12 +607,92 @@ export function oddsTable(protocols: SnapshotProtocol[], model: ModelConstants =
   return { global, byCategory, byTier, catCounts, tierCounts };
 }
 
-/** A launch candidate's odds: the average of its category rate and its TVL-tier rate, clamped. */
+/** A launch candidate's radar-3 odds: the average of its category rate and its TVL-tier rate, clamped. */
 export function tokenOdds(protocol: SnapshotProtocol, table: OddsTable, model: ModelConstants = MODEL): number {
   const cat = table.byCategory.get(protocol.category ?? 'Other') ?? table.global;
   const tier = table.byTier.get(tvlTier(protocol.tvl_usd)) ?? table.global;
   const odds = (cat + tier) / 2;
   return Math.min(model.odds_cap, Math.max(model.odds_floor, odds));
+}
+
+/** A category's token rate, Laplace-smoothed toward the global rate: the logistic model's last feature. */
+export function categoryRate(protocol: SnapshotProtocol, protocols: SnapshotProtocol[], global: number, model: ModelConstants = MODEL): number {
+  const key = protocol.category ?? 'Other';
+  let n = 0;
+  let tok = 0;
+  for (const q of protocols) {
+    if ((q.category ?? 'Other') === key) {
+      n += 1;
+      if (hasTokenRecord(q)) tok += 1;
+    }
+  }
+  return n === 0 ? global : (tok + model.odds_prior_weight * global) / (n + model.odds_prior_weight);
+}
+
+/**
+ * The logistic odds' six features: intercept, log TVL, log age, seven-day growth over 100,
+ * log chain count, and the category's smoothed token rate. Age unknown is 365 days, growth is
+ * clamped to [-60, 120] percent, the same shapes the value model uses.
+ */
+export function logitFeatures(protocol: SnapshotProtocol, asOf: string, catRate: number, model: ModelConstants = MODEL): number[] {
+  const age = ageDays(asOf, protocol.listed_at) ?? model.unknown_age_days;
+  const growth = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(protocol.change_7d, 0)));
+  return [1, Math.log(Math.max(1, protocol.tvl_usd)), Math.log(Math.max(1, age)), growth / 100, Math.log(Math.max(1, protocol.chains.length)), catRate];
+}
+
+/** The fitted logistic model: standardized coefficients, means and standard deviations. */
+export interface FittedLogit {
+  beta: number[];
+  mu: number[];
+  sd: number[];
+}
+
+/**
+ * The logistic regression, fit by full-batch gradient descent on standardized features:
+ * learning rate 0.1, 2000 iterations, beta starting at zero. No random source anywhere, so the
+ * fit is the same on every run. Standard deviations are the population ones (divided by n).
+ */
+export function fitLogit(rows: { x: number[]; y: number }[], model: ModelConstants = MODEL): FittedLogit {
+  const k = rows[0]!.x.length;
+  const n = rows.length;
+  const mu = new Array<number>(k).fill(0);
+  const sd = new Array<number>(k).fill(0);
+  for (let j = 1; j < k; j++) {
+    mu[j] = rows.reduce((s, r) => s + r.x[j]!, 0) / n;
+    sd[j] = Math.sqrt(rows.reduce((s, r) => s + (r.x[j]! - mu[j]!) * (r.x[j]! - mu[j]!), 0) / n) || 1;
+  }
+  const z = rows.map((r) => r.x.map((v, j) => (j === 0 ? v : (v - mu[j]!) / sd[j]!)));
+  const beta = new Array<number>(k).fill(0);
+  for (let it = 0; it < model.logit_iterations; it++) {
+    const grad = new Array<number>(k).fill(0);
+    for (let i = 0; i < n; i++) {
+      const zx = z[i]!;
+      let s = 0;
+      for (let j = 0; j < k; j++) s += beta[j]! * zx[j]!;
+      const pr = 1 / (1 + Math.exp(-s));
+      const err = pr - rows[i]!.y;
+      for (let j = 0; j < k; j++) grad[j]! += err * zx[j]!;
+    }
+    for (let j = 0; j < k; j++) beta[j]! -= (model.logit_lr * grad[j]!) / n;
+  }
+  return { beta, mu, sd };
+}
+
+/** The logistic odds of one protocol, clamped to [odds_floor, odds_cap]. */
+export function logitOdds(x: number[], fitted: FittedLogit, model: ModelConstants = MODEL): number {
+  let s = 0;
+  for (let j = 0; j < x.length; j++) {
+    const zj = j === 0 ? x[j]! : (x[j]! - fitted.mu[j]!) / fitted.sd[j]!;
+    s += fitted.beta[j]! * zj;
+  }
+  const pr = 1 / (1 + Math.exp(-s));
+  return Math.min(model.odds_cap, Math.max(model.odds_floor, pr));
+}
+
+/** The logistic odds of one protocol from its record, with a category rate computed on `protocols`. */
+export function logitOddsFor(protocol: SnapshotProtocol, asOf: string, protocols: SnapshotProtocol[], fitted: FittedLogit, global: number, model: ModelConstants = MODEL): number {
+  const catRate = categoryRate(protocol, protocols, global, model);
+  return logitOdds(logitFeatures(protocol, asOf, catRate, model), fitted, model);
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -572,12 +764,239 @@ function baselinePredictions(trainAll: SnapshotProtocol[], test: SnapshotProtoco
 }
 
 /**
+ * Generic ordinary least squares by the normal equations, solved with Gaussian elimination and
+ * partial pivoting, a 1e-9 ridge on the diagonal for stability. Used for the fitted-terms test,
+ * where the feature count varies.
+ */
+export function olsGeneric(X: number[][], y: number[]): number[] {
+  const k = X[0]!.length;
+  const A: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  const b = new Array<number>(k).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let r = 0; r < k; r++) {
+      b[r]! += X[i]![r]! * y[i]!;
+      for (let c = 0; c < k; c++) A[r]![c]! += X[i]![r]! * X[i]![c]!;
+    }
+  }
+  for (let r = 0; r < k; r++) A[r]![r]! += 1e-9;
+  const M = A.map((row, i) => [...row, b[i]!]);
+  for (let col = 0; col < k; col++) {
+    let piv = col;
+    for (let r = col + 1; r < k; r++) if (Math.abs(M[r]![col]!) > Math.abs(M[piv]![col]!)) piv = r;
+    const tmp = M[col]!;
+    M[col] = M[piv]!;
+    M[piv] = tmp;
+    const d = M[col]![col]!;
+    for (let r = 0; r < k; r++) {
+      if (r === col) continue;
+      const f = M[r]![col]! / d;
+      for (let c = col; c <= k; c++) M[r]![c]! -= f * M[col]![c]!;
+    }
+  }
+  return M.map((row, i) => row[k]! / row[i]!);
+}
+
+/** The value model's feature sets: base, plus one extra term each, and all three together. */
+function valueFeatures(variant: string): (p: SnapshotProtocol, asOf: string) => number[] {
+  const base = (p: SnapshotProtocol): number[] => [1, Math.log(p.tvl_usd)];
+  const logAge = (p: SnapshotProtocol, asOf: string): number => Math.log(Math.max(1, ageDays(asOf, p.listed_at) ?? 365));
+  const growth = (p: SnapshotProtocol): number => Math.min(120, Math.max(-60, finite(p.change_7d, 0))) / 100;
+  const logChains = (p: SnapshotProtocol): number => Math.log(Math.max(1, p.chains.length));
+  if (variant === '+logAge') return (p, asOf) => [...base(p), logAge(p, asOf)];
+  if (variant === '+growth') return (p) => [...base(p), growth(p)];
+  if (variant === '+logChains') return (p) => [...base(p), logChains(p)];
+  if (variant === 'all') return (p, asOf) => [...base(p), logAge(p, asOf), growth(p), logChains(p)];
+  return (p) => base(p);
+}
+
+/** Category offsets for a generic OLS fit: mean residual per category, shrunk toward zero. */
+function genericOffsets(train: SnapshotProtocol[], beta: number[], featFn: (p: SnapshotProtocol, asOf: string) => number[], asOf: string, model: ModelConstants = MODEL): Map<string, number> {
+  const sums = new Map<string, { sum: number; n: number }>();
+  for (const p of train) {
+    const x = featFn(p, asOf);
+    let pred = 0;
+    for (let j = 0; j < beta.length; j++) pred += beta[j]! * x[j]!;
+    const r = Math.log(p.mcap_usd as number) - pred;
+    const key = p.category ?? 'Other';
+    const e = sums.get(key) ?? { sum: 0, n: 0 };
+    e.sum += r;
+    e.n += 1;
+    sums.set(key, e);
+  }
+  const out = new Map<string, number>();
+  for (const [key, e] of sums) out.set(key, (e.n * (e.sum / e.n)) / (e.n + model.peer_prior_weight));
+  return out;
+}
+
+/** Fit a generic value model (OLS + category offsets) on a training set. */
+function fitGeneric(train: SnapshotProtocol[], variant: string, asOf: string, model: ModelConstants = MODEL): { beta: number[]; offs: Map<string, number>; featFn: (p: SnapshotProtocol, asOf: string) => number[] } {
+  const featFn = valueFeatures(variant);
+  const X = train.map((p) => featFn(p, asOf));
+  const y = train.map((p) => Math.log(p.mcap_usd as number));
+  const beta = olsGeneric(X, y);
+  const offs = genericOffsets(train, beta, featFn, asOf, model);
+  return { beta, offs, featFn };
+}
+
+/** A generic value model's log prediction for one protocol. */
+function genericPredLog(p: SnapshotProtocol, fit: { beta: number[]; offs: Map<string, number>; featFn: (p: SnapshotProtocol, asOf: string) => number[] }, asOf: string): number {
+  const x = fit.featFn(p, asOf);
+  let pred = 0;
+  for (let j = 0; j < fit.beta.length; j++) pred += fit.beta[j]! * x[j]!;
+  return pred + (fit.offs.get(p.category ?? 'Other') ?? 0);
+}
+
+/**
+ * The fitted-terms test: five-fold cross-validation of the base value model against four
+ * variants that add log(age), seven-day growth, log(chain count) or all three as fitted terms.
+ * A variant that hurts held-out log R2 is a term that does not belong in the regression.
+ */
+export function fittedTermsTest(train: SnapshotProtocol[], asOf: string, model: ModelConstants = MODEL): FittedTermsTest[] {
+  const variants = ['base', '+logAge', '+growth', '+logChains', 'all'];
+  const out: FittedTermsTest[] = [];
+  for (const variant of variants) {
+    const actual: number[] = [];
+    const pred: number[] = [];
+    for (let f = 0; f < model.cv_folds; f++) {
+      const tr = train.filter((_, i) => i % model.cv_folds !== f);
+      const te = train.filter((_, i) => i % model.cv_folds === f);
+      const fit = fitGeneric(tr, variant, asOf, model);
+      for (const p of te) {
+        actual.push(Math.log(p.mcap_usd as number));
+        pred.push(genericPredLog(p, fit, asOf));
+      }
+    }
+    const m = validationMetrics(actual, pred);
+    out.push({ variant, log_r2: round4(m.logR2), median_ape: m.medianApe, log_rmse: m.logRmse });
+  }
+  return out;
+}
+
+/**
+ * Leave-one-out validation of the base value model: each live protocol is scored by a model
+ * fit on the other 127. The most honest small-sample check the snapshot allows.
+ */
+export function leaveOneOut(train: SnapshotProtocol[], asOf: string, model: ModelConstants = MODEL): ValidationFold {
+  const actual: number[] = [];
+  const pred: number[] = [];
+  for (let i = 0; i < train.length; i++) {
+    const tr = train.filter((_, j) => j !== i);
+    const fit = fitGeneric(tr, 'base', asOf, model);
+    actual.push(Math.log(train[i]!.mcap_usd as number));
+    pred.push(genericPredLog(train[i]!, fit, asOf));
+  }
+  const m = validationMetrics(actual, pred);
+  return { name: 'Leave-one-out, radar-4', test_protocols: train.length, log_r2: round4(m.logR2), median_ape: m.medianApe, mape: m.mape, log_rmse: m.logRmse };
+}
+
+/**
+ * The pooled walk-forward check: the dated live protocols (95 of them) in five time folds by
+ * listed_at, each fold trained on all earlier protocols and tested on the next 19. The pooled
+ * score is over all 76 held-out protocols. The per-fold numbers show the comps curve holding
+ * forward in time until the 2024 cohort, then the regime shifting.
+ */
+export function walkForward(train: SnapshotProtocol[], asOf: string, model: ModelConstants = MODEL): WalkForward {
+  const dated = train
+    .filter((p) => p.listed_at !== null)
+    .sort((a, b) => (a.listed_at as string) < (b.listed_at as string) ? -1 : 1);
+  const folds = model.cv_folds;
+  const size = Math.floor(dated.length / folds);
+  const foldRows: WalkForwardFold[] = [];
+  const pooledActual: number[] = [];
+  const pooledPred: number[] = [];
+  for (let k = 1; k < folds; k++) {
+    const tr = dated.slice(0, k * size);
+    const te = dated.slice(k * size, (k + 1) * size);
+    const fit = fitGeneric(tr, 'base', asOf, model);
+    const a = te.map((p) => Math.log(p.mcap_usd as number));
+    const pr = te.map((p) => genericPredLog(p, fit, asOf));
+    const m = validationMetrics(a, pr);
+    foldRows.push({
+      fold: k,
+      train_protocols: tr.length,
+      test_protocols: te.length,
+      from: te[0]!.listed_at as string,
+      log_r2: round4(m.logR2),
+      median_ape: m.medianApe,
+    });
+    pooledActual.push(...a);
+    pooledPred.push(...pr);
+  }
+  const pooled = validationMetrics(pooledActual, pooledPred);
+  return {
+    folds: foldRows,
+    pooled: { test_protocols: pooledActual.length, log_r2: round4(pooled.logR2), median_ape: pooled.medianApe },
+  };
+}
+
+/**
+ * The odds' five-fold cross-validation, on all 758 protocols: the logistic regression against
+ * the radar-3 smoothed average, scored by Brier score and log-loss, with the logistic odds'
+ * held-out calibration in five bins. One pass scores both, so the comparison is on the same
+ * folds and the same held-out protocols.
+ */
+export function oddsCrossValidation(protocols: SnapshotProtocol[], asOf: string, model: ModelConstants = MODEL): { comparison: OddsComparison; calibration: CalibrationBin[] } {
+  const sorted = [...protocols].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const folds = model.cv_folds;
+  let brierLog = 0;
+  let llLog = 0;
+  let brierSm = 0;
+  let llSm = 0;
+  let n = 0;
+  const bins = Array.from({ length: 5 }, (_, i) => ({ lo: i * 0.2, hi: (i + 1) * 0.2, n: 0, predSum: 0, tok: 0 }));
+  for (let f = 0; f < folds; f++) {
+    const tr = sorted.filter((_, i) => i % folds !== f);
+    const te = sorted.filter((_, i) => i % folds === f);
+    const table = oddsTable(tr, model);
+    const rows = tr.map((p) => ({ x: logitFeatures(p, asOf, categoryRate(p, tr, table.global, model), model), y: hasTokenRecord(p) ? 1 : 0 }));
+    const fitted = fitLogit(rows, model);
+    for (const p of te) {
+      const y = hasTokenRecord(p) ? 1 : 0;
+      const pLog = logitOddsFor(p, asOf, tr, fitted, table.global, model);
+      const pSm = tokenOdds(p, table, model);
+      const clampLL = (v: number): number => Math.min(0.999, Math.max(0.001, v));
+      brierLog += (pLog - y) * (pLog - y);
+      llLog += y ? -Math.log(clampLL(pLog)) : -Math.log(1 - clampLL(pLog));
+      brierSm += (pSm - y) * (pSm - y);
+      llSm += y ? -Math.log(clampLL(pSm)) : -Math.log(1 - clampLL(pSm));
+      n += 1;
+      const bin = bins[Math.min(4, Math.floor(pLog * 5))]!;
+      bin.n += 1;
+      bin.predSum += pLog;
+      if (y === 1) bin.tok += 1;
+    }
+  }
+  const calibration: CalibrationBin[] = bins.map((b) => ({
+    lo: round4(b.lo),
+    hi: round4(b.hi),
+    n: b.n,
+    mean_pred: round4(b.n === 0 ? 0 : b.predSum / b.n),
+    actual_rate: round4(b.n === 0 ? 0 : b.tok / b.n),
+  }));
+  return {
+    comparison: {
+      logistic: { brier: round4(brierLog / n), log_loss: round4(llLog / n) },
+      smoothed: { brier: round4(brierSm / n), log_loss: round4(llSm / n) },
+    },
+    calibration,
+  };
+}
+
+/** The full-data logistic odds model, fit on all 758 protocols. */
+export function fitLogitFull(protocols: SnapshotProtocol[], asOf: string, model: ModelConstants = MODEL): { fitted: FittedLogit; global: number } {
+  const table = oddsTable(protocols, model);
+  const rows = protocols.map((p) => ({ x: logitFeatures(p, asOf, categoryRate(p, protocols, table.global, model), model), y: hasTokenRecord(p) ? 1 : 0 }));
+  return { fitted: fitLogit(rows, model), global: table.global };
+}
+
+/**
  * The validation: five-fold cross-validation (a protocol's fold is its index in slug order,
  * mod 5) and a single 80/20 split (fold 0 held out), each fitting the regression on the
- * training folds only, with the first radar's median model scored on the same folds beside it.
- * The baseline's training set for a fold is the same training folds plus the protocols with a
- * zero or negative market cap, which the first radar's peer table counted and which are never
- * in the test set.
+ * training folds only, with the first radar's median model scored on the same folds beside it;
+ * the fitted-terms test, the leave-one-out check, the pooled walk-forward check, and the odds'
+ * five-fold cross-validation with its calibration bins. The baseline's training set for a fold
+ * is the same training folds plus the protocols with a zero or negative market cap, which the
+ * first radar's peer table counted and which are never in the test set.
  */
 export function validate(train: SnapshotProtocol[], snapshot: Snapshot, model: ModelConstants = MODEL): Validation {
   const folds = model.cv_folds;
@@ -614,6 +1033,9 @@ export function validate(train: SnapshotProtocol[], snapshot: Snapshot, model: M
   const split = validationMetrics(te.map((p) => Math.log(p.mcap_usd as number)), splitPred);
   const splitB = validationMetrics(te.map((p) => Math.log(p.mcap_usd as number)), splitBase);
 
+  const { fitted: logitFull } = fitLogitFull(snapshot.protocols, snapshot.as_of, model);
+  const odds = oddsCrossValidation(snapshot.protocols, snapshot.as_of, model);
+
   return {
     model: MODEL_VERSION,
     train_protocols: train.length,
@@ -621,41 +1043,170 @@ export function validate(train: SnapshotProtocol[], snapshot: Snapshot, model: M
     split_80_20: { name: '80/20 split (fold 0 held out)', test_protocols: te.length, log_r2: round4(split.logR2), median_ape: split.medianApe, mape: split.mape, log_rmse: split.logRmse },
     baseline: { name: `${folds}-fold cross-validation (radar-2 median)`, test_protocols: train.length, log_r2: round4(cvB.logR2), median_ape: cvB.medianApe, mape: cvB.mape, log_rmse: cvB.logRmse },
     baseline_split_80_20: { name: '80/20 split (radar-2 median)', test_protocols: te.length, log_r2: round4(splitB.logR2), median_ape: splitB.medianApe, mape: splitB.mape, log_rmse: splitB.logRmse },
+    fitted_terms: fittedTermsTest(train, snapshot.as_of, model),
+    walk_forward: walkForward(train, snapshot.as_of, model),
+    loo: leaveOneOut(train, snapshot.as_of, model),
+    odds_comparison: odds.comparison,
+    calibration: odds.calibration,
+    logit_coefficients: logitFull.beta.map((b) => round4(b)),
   };
 }
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
+/** What one transaction costs on a chain, in dollars: L1s are dear, L2s and Solana are cheap. */
+export function gasUsd(chain: string): number {
+  const c = (chain || '').toLowerCase();
+  if (c === 'ethereum') return 8;
+  if (c === 'solana') return 0.05;
+  if (c === 'base' || c === 'arbitrum' || c === 'optimism' || c === 'polygon' || c === 'monad' || c === 'hyperliquid l1' || c === 'plasma' || c === 'arc' || c === 'avalanche' || c === 'bsc' || c === 'binance') return 0.5;
+  return 2;
+}
+
+/** How much capital one farm position needs, from the protocol's own TVL. */
+export function capitalFor(p: SnapshotProtocol): number {
+  if (p.tvl_usd >= 5_000_000_000) return 250;
+  if (p.tvl_usd >= 1_000_000_000) return 150;
+  if (p.tvl_usd >= 100_000_000) return 100;
+  return 50;
+}
+
+/**
+ * A launch candidate's farm verdict, from its expected net. The farmer is assumed to hold one
+ * basis point of the launch, so the expected gain is odds x 0.0001 x fitted value; the cost is
+ * eight transactions' gas plus 2% of the capital the plan deposits. FARM when the net clears
+ * $25, THIN when it is positive, SKIP when it is not. The assumption is the reader's to argue
+ * with: the dashboard states it beside the verdict.
+ */
+export function farmVerdict(
+  p: SnapshotProtocol,
+  fitted: number,
+  odds: number,
+  model: ModelConstants = MODEL,
+): { verdict: FarmVerdict; gain: number; cost: number; net: number } {
+  const gain = odds * model.farm_share * fitted;
+  const cost = model.farm_tx_count * gasUsd(p.chains.length > 0 ? p.chains[0]! : '') + model.farm_capital_rate * capitalFor(p);
+  const net = gain - cost;
+  const verdict: FarmVerdict = net > model.farm_threshold_usd ? 'FARM' : net > 0 ? 'THIN' : 'SKIP';
+  return { verdict, gain, cost, net };
+}
+
+/** A seeded generator (mulberry32): the bootstrap's only source of randomness, so both graded runs agree. */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * The bootstrap rank ranges: refit the value model on resamples of the live protocols, re-rank
+ * the whole board each time, and report each launch candidate's rank's 10th and 90th
+ * percentile. The logistic odds are fit on the whole snapshot's token record, so they do not
+ * move across refits; the fitted values do, and that is the uncertainty the range measures.
+ */
+export function bootstrapRankRanges(
+  snapshot: Snapshot,
+  train: SnapshotProtocol[],
+  logit: FittedLogit,
+  global: number,
+  model: ModelConstants = MODEL,
+): Map<string, { lo: number; hi: number }> {
+  const rng = mulberry32(model.bootstrap_seed);
+  const candidates = snapshot.protocols.filter((p) => tokenStatus(p) === 'pre-token');
+  const ranks = new Map<string, number[]>();
+  for (const p of candidates) ranks.set(p.slug, []);
+  // The logistic odds are fit on the whole snapshot's token record, so they do not move
+  // across refits: compute them once, not once per protocol per refit.
+  const oddsBySlug = new Map<string, number>();
+  for (const p of snapshot.protocols) {
+    if (tokenStatus(p) === 'pre-token') oddsBySlug.set(p.slug, logitOddsFor(p, snapshot.as_of, snapshot.protocols, logit, global, model));
+  }
+  const impliedFor = (p: SnapshotProtocol, fit: { intercept: number; slope: number }, offsets: Map<string, { offset: number; peers: number }>): number => {
+    const status = tokenStatus(p);
+    const v = fittedValue(p, snapshot.as_of, fit, offsets, model);
+    if (status === 'live') return p.mcap_usd !== null && p.mcap_usd > 0 ? p.mcap_usd : v.fitted;
+    if (status === 'token-trades') return v.fitted;
+    if (status === 'not-a-launch') return Math.max(1, Math.round(v.fitted * model.odds_non_launch));
+    const odds = oddsBySlug.get(p.slug) ?? model.odds_floor;
+    return Math.max(1, Math.round(v.fitted * odds));
+  };
+  for (let b = 0; b < model.bootstrap_refits; b++) {
+    const sample = Array.from({ length: train.length }, () => train[Math.floor(rng() * train.length)]!);
+    const fit = olsLogLog(sample);
+    const offsets = categoryOffsets(sample, fit, model);
+    const scored = snapshot.protocols.map((p) => ({ slug: p.slug, implied: impliedFor(p, fit, offsets) }));
+    scored.sort((a, c) => c.implied - a.implied || (a.slug < c.slug ? -1 : a.slug > c.slug ? 1 : 0));
+    for (let i = 0; i < scored.length; i++) {
+      const list = ranks.get(scored[i]!.slug);
+      if (list !== undefined) list.push(i + 1);
+    }
+  }
+  const out = new Map<string, { lo: number; hi: number }>();
+  for (const [slug, list] of ranks) {
+    const sorted = [...list].sort((a, b) => a - b);
+    const lo = sorted[Math.floor(0.1 * (sorted.length - 1))]!;
+    const hi = sorted[Math.floor(0.9 * (sorted.length - 1))]!;
+    out.set(slug, { lo, hi });
+  }
+  return out;
+}
+
 /** The protocols the board ranks, strongest first, with ranks 1..n: every protocol in the snapshot. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; fit: { intercept: number; slope: number }; offsets: Map<string, { offset: number; peers: number }>; odds: OddsTable; validation: Validation } {
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; fit: { intercept: number; slope: number }; offsets: Map<string, { offset: number; peers: number }>; odds: OddsTable; logit: FittedLogit; logitGlobal: number; validation: Validation } {
   const train = trainSet(snapshot.protocols);
   const fit = olsLogLog(train);
   const offsets = categoryOffsets(train, fit, model);
   const odds = oddsTable(snapshot.protocols, model);
+  const { fitted: logit, global: logitGlobal } = fitLogitFull(snapshot.protocols, snapshot.as_of, model);
   const validation = validate(train, snapshot, model);
+  const ranges = bootstrapRankRanges(snapshot, train, logit, logitGlobal, model);
 
   const scored = snapshot.protocols.map((p) => {
     const status = tokenStatus(p);
     const v = fittedValue(p, snapshot.as_of, fit, offsets, model);
     let implied: number;
     let oddsValue: number | null;
+    let smoothed: number | null;
+    let verdict: FarmVerdict;
+    let gain: number | null = null;
+    let cost: number | null = null;
+    let net: number | null = null;
+    let range: { lo: number; hi: number } | null = null;
     if (status === 'live') {
       // The market cap is the fact, except when the snapshot records it as zero or negative:
       // a token that trades but whose market cap is not a positive number takes the fitted
       // value instead, so no row ever carries an implied value of zero or less.
       implied = p.mcap_usd !== null && p.mcap_usd > 0 ? p.mcap_usd : v.fitted;
       oddsValue = null;
+      smoothed = null;
+      verdict = 'YIELD';
     } else if (status === 'token-trades') {
       implied = v.fitted;
       oddsValue = null;
+      smoothed = null;
+      verdict = 'YIELD';
     } else if (status === 'not-a-launch') {
       implied = Math.max(1, Math.round(v.fitted * model.odds_non_launch));
       oddsValue = model.odds_non_launch;
+      smoothed = model.odds_non_launch;
+      verdict = 'SKIP';
     } else {
-      oddsValue = tokenOdds(p, odds, model);
+      oddsValue = logitOddsFor(p, snapshot.as_of, snapshot.protocols, logit, logitGlobal, model);
+      smoothed = tokenOdds(p, odds, model);
       implied = Math.max(1, Math.round(v.fitted * oddsValue));
+      const fv = farmVerdict(p, v.fitted, oddsValue, model);
+      verdict = fv.verdict;
+      gain = Math.round(fv.gain);
+      cost = round2(fv.cost);
+      net = Math.round(fv.net);
+      range = ranges.get(p.slug) ?? null;
     }
-    return { p, status, v, implied, tokenOdds: oddsValue };
+    return { p, status, v, implied, tokenOdds: oddsValue, smoothed, verdict, gain, cost, net, range };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   const board: BoardRow[] = scored.map((s, i) => ({
@@ -673,9 +1224,16 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     token_status: s.status,
     age_days: s.v.age,
     implied_value_usd: s.implied,
+    farm_verdict: s.verdict,
+    expected_gain_usd: s.gain,
+    farm_cost_usd: s.cost,
+    expected_net_usd: s.net,
+    rank_range_lo: s.range === null ? null : s.range.lo,
+    rank_range_hi: s.range === null ? null : s.range.hi,
     model: {
       fitted_value_usd: s.v.fitted,
       token_odds: s.tokenOdds === null ? null : round4(s.tokenOdds),
+      token_odds_smoothed: s.smoothed === null ? null : round4(s.smoothed),
       // Full precision here, not rounded: the dashboard recomputes each row from these
       // numbers and its check of board.json must come out exact.
       intercept: fit.intercept,
@@ -690,7 +1248,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     },
     farm_steps: farmSteps(s.p, s.v.age, s.status).map(stepText),
   }));
-  return { board, fit, offsets, odds, validation };
+  return { board, fit, offsets, odds, logit, logitGlobal, validation };
 }
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
@@ -713,14 +1271,6 @@ function gasFor(chain: string): string {
   if (c === 'solana') return 'about $0.05 of gas';
   if (c === 'base' || c === 'arbitrum' || c === 'optimism' || c === 'polygon' || c === 'monad' || c === 'hyperliquid l1' || c === 'plasma' || c === 'arc' || c === 'avalanche' || c === 'bsc' || c === 'binance') return 'about $0.50 of gas';
   return 'about $2 of gas';
-}
-
-/** How much capital one farm position needs, from the protocol's own TVL. */
-function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 5_000_000_000) return 250;
-  if (p.tvl_usd >= 1_000_000_000) return 150;
-  if (p.tvl_usd >= 100_000_000) return 100;
-  return 50;
 }
 
 /** How long to hold, from the protocol's age: younger protocols get a longer qualifying window. */
@@ -828,6 +1378,7 @@ export function radarRow(row: BoardRow): RadarRow {
     token_status: row.token_status,
     fitted_value_usd: row.model.fitted_value_usd,
     token_odds: row.model.token_odds,
+    token_odds_smoothed: row.model.token_odds_smoothed,
     intercept: row.model.intercept,
     slope: row.model.slope,
     category_offset: row.model.category_offset,
@@ -835,12 +1386,18 @@ export function radarRow(row: BoardRow): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
+    farm_verdict: row.farm_verdict,
+    expected_gain_usd: row.expected_gain_usd,
+    farm_cost_usd: row.farm_cost_usd,
+    expected_net_usd: row.expected_net_usd,
+    rank_range_lo: row.rank_range_lo,
+    rank_range_hi: row.rank_range_hi,
   };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const { board, fit, offsets, odds, validation } = buildBoard(snapshot, model);
+  const { board, fit, offsets, odds, logit, logitGlobal, validation } = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const train = trainSet(snapshot.protocols);
   const curve: CurvePoint[] = train.map((p) => ({
@@ -850,11 +1407,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     category: p.category,
   }));
   const counts = { pre: 0, live: 0, trades: 0, notLaunch: 0 };
+  const verdicts: VerdictCounts = { FARM: 0, THIN: 0, SKIP: 0, YIELD: 0 };
   for (const r of board) {
     if (r.token_status === 'pre-token') counts.pre += 1;
     else if (r.token_status === 'live') counts.live += 1;
     else if (r.token_status === 'token-trades') counts.trades += 1;
     else counts.notLaunch += 1;
+    verdicts[r.farm_verdict] += 1;
   }
   const oddsData: OddsData = { global: odds.global, by_category: {}, by_tier: {} };
   for (const [c, v] of odds.catCounts) oddsData.by_category[c] = v;
@@ -878,6 +1437,9 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     validation,
     curve,
     odds: oddsData,
+    logit: { beta: logit.beta, mu: logit.mu, sd: logit.sd },
+    verdict_counts: verdicts,
+    bootstrap: { refits: model.bootstrap_refits, seed: model.bootstrap_seed },
     rows: board.map(radarRow),
     live,
   };

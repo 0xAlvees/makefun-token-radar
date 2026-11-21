@@ -1,4 +1,4 @@
-// Token Radar's dashboard, radar-6. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Token Radar's dashboard, radar-7. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board, a KPI strip, an integrity strip, a top-3 launch spotlight, a
 // filterable table, a per-protocol detail view with the model's own inputs, its farm verdict and
 // the protocol's farm plan, and the fitted curve with the held-out validation. No network: every
@@ -62,24 +62,18 @@
     var odds = (catRate + tierRate) / 2;
     return { odds: Math.min(DATA.model.odds_cap, Math.max(DATA.model.odds_floor, odds)), catRate: catRate, tierRate: tierRate };
   }
-  // The radar-6 odds: a logistic regression on log TVL, log age, seven-day growth, log chain
-  // count, the category's smoothed token rate, and a listed-2024-or-later step. Same features,
-  // same standardization and the same dot product main.ts runs, so the recompute matches
-  // board.json. A protocol with no listed date takes the step's 0.
+  // The radar-7 odds: a logistic regression on log TVL, log age, seven-day growth, log chain
+  // count and the category's smoothed token rate. Same features, same standardization and the
+  // same dot product main.ts runs, so the recompute matches board.json.
   function catRateFor(row) {
     var cat = DATA.odds.by_category[row.category || 'Other'];
     return cat ? smoothRate(cat.tok, cat.n) : DATA.odds.global;
-  }
-  function eraStep(row) {
-    if (!row.listed_at) return 0;
-    var year = parseInt(String(row.listed_at).slice(0, 4), 10);
-    return (isFinite(year) && year >= DATA.model.odds_era_year) ? 1 : 0;
   }
   function logitOdds(row) {
     var m = DATA.model;
     var age = (row.age_days === null || row.age_days === undefined) ? m.unknown_age_days : row.age_days;
     var growth = Math.min(m.growth_cap, Math.max(m.growth_floor, (row.change_7d === null || row.change_7d === undefined) ? 0 : row.change_7d));
-    var x = [1, Math.log(Math.max(1, row.tvl_usd)), Math.log(Math.max(1, age)), growth / 100, Math.log(Math.max(1, (row.chains || []).length)), catRateFor(row), eraStep(row)];
+    var x = [1, Math.log(Math.max(1, row.tvl_usd)), Math.log(Math.max(1, age)), growth / 100, Math.log(Math.max(1, (row.chains || []).length)), catRateFor(row)];
     var s = 0;
     for (var j = 0; j < x.length; j++) {
       var zj = j === 0 ? x[j] : (x[j] - DATA.logit.mu[j]) / DATA.logit.sd[j];
@@ -534,9 +528,9 @@
       ),
       el('p', { class: 'model-note' },
         el('b', { text: 'The fitted value: ' }),
-        'a regression of log market cap on log TVL, fit by a Huber robust regression on the ', String(v.train_protocols), ' protocols that already trade: iteratively reweighted least squares, delta ', String(m.huber_delta), ', the scale from the median absolute deviation of the residuals, at most ', String(m.huber_max_iterations), ' iterations, starting from the least-squares fit. Log market-cap residuals are heavy-tailed, so a few outlier peers would drag a least-squares line; the Huber line downweights them. Each category takes its median residual shrunk toward zero by a prior weight of ', String(m.peer_prior_weight), '. The fitted value is the conditional median: exp() of the log prediction, with no smearing correction. Growth, maturity and chain are bounded multipliers (growth 1 + clamp(change_7d, ', String(m.growth_floor), ', ', String(m.growth_cap), ') / 100 x ', String(m.growth_weight), '; maturity ', String(m.maturity_floor), ' + min(age, ', String(m.maturity_days), ') / ', String(m.maturity_days), ' x ', String(m.maturity_range), '; chain 1 + 0.02 x min(chains - 1, 5)). They were tested as fitted terms too, by the program, on five-fold cross-validation — held-out log R2: ', ftText, '. Every extra term hurts, so they stay bounded multipliers, not fitted terms. The value band is fitted x ', DATA.value_band.lo_mult.toFixed(2), ' to fitted x ', DATA.value_band.hi_mult.toFixed(1), ' (10th–90th percentile of the ', String(v.train_protocols), ' live peers\u2019 residuals of log market cap against log fitted value); the farm verdict uses the low end. ',
+        'a regression of log market cap on log TVL, fit by least squares on the ', String(v.train_protocols), ' protocols that already trade, with each category taking its median residual shrunk toward zero by a prior weight of ', String(m.peer_prior_weight), '. The fitted value is the conditional median: exp() of the log prediction, with no smearing correction. Growth, maturity and chain are bounded multipliers (growth 1 + clamp(change_7d, ', String(m.growth_floor), ', ', String(m.growth_cap), ') / 100 x ', String(m.growth_weight), '; maturity ', String(m.maturity_floor), ' + min(age, ', String(m.maturity_days), ') / ', String(m.maturity_days), ' x ', String(m.maturity_range), '; chain 1 + 0.02 x min(chains - 1, 5)). They were tested as fitted terms too, by the program, on five-fold cross-validation — held-out log R2: ', ftText, '. Every extra term hurts, so they stay bounded multipliers, not fitted terms. The value band is fitted x ', DATA.value_band.lo_mult.toFixed(2), ' to fitted x ', DATA.value_band.hi_mult.toFixed(1), ' (10th–90th percentile of the ', String(v.train_protocols), ' live peers\u2019 residuals of log market cap against log fitted value); the farm verdict uses the low end. ',
         el('b', { text: 'The odds: ' }),
-        'for a launch candidate, a logistic regression on log TVL, log age, seven-day growth, log chain count, its category token rate (Laplace-smoothed toward the global rate (', (DATA.global_token_rate * 100).toFixed(1), '%) with a prior weight of ', String(m.odds_prior_weight), ') and a listed-', String(m.odds_era_year), '-or-later step, standardized, gradient descent lr ', String(m.logit_lr), ', ', String(m.logit_iterations), ' iterations, clamped to [', String(m.odds_floor), ', ', String(m.odds_cap), ']. Coefficients: ', v.logit_coefficients.map(function (b) { return b.toFixed(3); }).join(', '), '. Held-out Brier ', v.odds_comparison.logistic.brier.toFixed(4), ' and log-loss ', v.odds_comparison.logistic.log_loss.toFixed(4), ', against the radar-3 smoothed average (category rate plus TVL-tier rate, halved): Brier ', v.odds_comparison.smoothed.brier.toFixed(4), ', log-loss ', v.odds_comparison.smoothed.log_loss.toFixed(4), '. The era step is there because the token rate is a step, not a slope, in listing time: protocols listed before 2024 record a token 78–80% of the time, the 2024 cohort 51%, 2025\u2019s 39%, 2026\u2019s 31% — younger protocols have had less time to launch, so the odds step down for the recent cohort. A protocol with no listed date takes the step\u2019s 0: its token rate is 0.79 over 113 protocols, the same as the pre-2024 cohorts. The odds are fitted on whether a protocol records a token in this snapshot, so a young protocol\u2019s lower odds partly reflect less time to launch, not a verdict that it never will. A protocol that cannot launch (exchange, bridge, liquid-staking product, versioned pool, wrapped or staked name) takes a structural floor of ', String(m.odds_non_launch), '.'
+        'for a launch candidate, a logistic regression on log TVL, log age, seven-day growth, log chain count and its category token rate (Laplace-smoothed toward the global rate (', (DATA.global_token_rate * 100).toFixed(1), '%) with a prior weight of ', String(m.odds_prior_weight), '), standardized, gradient descent lr ', String(m.logit_lr), ', ', String(m.logit_iterations), ' iterations, clamped to [', String(m.odds_floor), ', ', String(m.odds_cap), ']. Coefficients: ', v.logit_coefficients.map(function (b) { return b.toFixed(3); }).join(', '), '. Held-out Brier ', v.odds_comparison.logistic.brier.toFixed(4), ' and log-loss ', v.odds_comparison.logistic.log_loss.toFixed(4), ', against the radar-3 smoothed average (category rate plus TVL-tier rate, halved): Brier ', v.odds_comparison.smoothed.brier.toFixed(4), ', log-loss ', v.odds_comparison.smoothed.log_loss.toFixed(4), '. A protocol that cannot launch (exchange, bridge, liquid-staking product, versioned pool, wrapped or staked name) takes a structural floor of ', String(m.odds_non_launch), '.'
       ),
       el('div', { class: 'model-grid' },
         el('div', null,
@@ -559,6 +553,17 @@
         )
       ),
       el('div', { class: 'checks' },
+        el('div', null,
+          el('h3', { text: 'Negative control' }),
+          el('table', { class: 'valid' },
+            el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Same 5-fold held-out folds' }), el('th', { scope: 'col', class: 'num', text: 'n' }), el('th', { scope: 'col', class: 'num', text: 'log R2' }), el('th', { scope: 'col', class: 'num', text: 'Median err' }), el('th', { scope: 'col', class: 'num', text: 'log RMSE' }))),
+            el('tbody', null,
+              vrow('Fitted, ' + DATA.model_version, cv, true),
+              vrow('Naive median mcap/TVL multiple', v.naive_control, false)
+            )
+          ),
+          el('p', { class: 'model-note', text: 'Two-sided proof: the control is the simplest model that could plausibly rank launches — one global median multiple of market cap to TVL, fit on the training folds only, no regression, no category offsets, no multipliers — scored on the same folds. It scores log R2 ' + fmtR2(v.naive_control.log_r2) + ' with a median error of ' + (v.naive_control.median_ape * 100).toFixed(0) + '%; the fitted model beats it by ' + (cv.log_r2 - v.naive_control.log_r2).toFixed(3) + ' of log R2. The validation is real because the control fails: had the fitted model scored no better than a single median multiple, the whole ranking would be a flat multiple in disguise.' })
+        ),
         el('div', null,
           el('h3', { text: 'Walk-forward: tested forward in time' }),
           el('table', { class: 'valid' },
@@ -658,7 +663,6 @@
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Listed ' + DATA.model.odds_era_year + ' or later (odds step)' }), el('b', { class: 'num', text: eraStep(row) ? 'yes' : 'no' })),
         el('div', null, el('span', { text: 'Fitted log market cap' }), el('b', { class: 'num', text: v.fittedLog.toFixed(2) })),
         el('div', null, el('span', { text: 'Category offset · ' + (row.category || 'Other') + ' (n=' + row.category_live_peers + ')' }), el('b', { class: 'num', text: (row.category_offset >= 0 ? '+' : '') + row.category_offset.toFixed(2) })),
         el('div', null, el('span', { text: 'Fitted value' }), el('b', { class: 'num', text: fmtUsd(v.fitted) })),

@@ -1,7 +1,7 @@
 // Token Radar's entrypoint (Node 22, standard library only).
 //
 // It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
-// protocol in it with the radar-6 model in lib/model.ts, writes the ranked board to
+// protocol in it with the radar-7 model in lib/model.ts, writes the ranked board to
 // /output/board.json, writes the dashboard's data to /output/data.js, copies this repository's
 // dashboard/ and screenshots/ to /output, and writes /output/dossier.json with the vendored
 // make.fun library. The program runs twice in grading and both runs must write the same bytes,
@@ -95,6 +95,7 @@ for (const name of shots) {
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 const cv = radar.validation.folds[0]!;
+const nc = radar.validation.naive_control;
 const split = radar.validation.split_80_20;
 const baseSplit = radar.validation.baseline_split_80_20;
 const wf = radar.validation.walk_forward;
@@ -104,6 +105,7 @@ const ft = radar.validation.fitted_terms;
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.pre_token_size} pre-token, ${radar.live_size} live, ${radar.token_trades_size} token-trades, ${radar.not_a_launch_size} not-a-launch)\n` +
     `token radar: ${radar.model_version} log(mcap) = ${radar.intercept} + ${radar.slope} x log(tvl), ${radar.validation.train_protocols} live peers, ${cv.name}: log R2 ${cv.log_r2}, median APE ${cv.median_ape}, log RMSE ${cv.log_rmse}\n` +
+    `token radar: negative control (same 5-fold held-out folds): naive median mcap/TVL multiple log R2 ${nc.log_r2}, median APE ${nc.median_ape}, log RMSE ${nc.log_rmse} — fitted beats it by ${(cv.log_r2 - nc.log_r2).toFixed(3)} log R2\n` +
     `token radar: value band fitted x ${radar.value_band.lo_mult} to x ${radar.value_band.hi_mult} (p10-p90 of live-peer log residuals, sd ${radar.value_band.resid_sd}); farm verdicts are from the low end\n` +
     `token radar: ${split.name}: log R2 ${split.log_r2}, median APE ${split.median_ape}, log RMSE ${split.log_rmse} (radar-2 median on the same fold: log R2 ${baseSplit.log_r2}, median APE ${baseSplit.median_ape})\n` +
     `token radar: fitted terms (5-fold log R2): ${ft.map((t) => `${t.variant} ${t.log_r2}`).join(', ')}\n` +

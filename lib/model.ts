@@ -1,4 +1,20 @@
-// Token Radar's model, radar-4: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model, radar-5: one snapshot of the protocol universe in, one ranked board out.
+// radar-5 changes two things against radar-4, both measured held-out on the same snapshot:
+//
+//   1. The category offset is the category's MEDIAN residual, not its mean, shrunk toward zero
+//      by the same prior weight of 3. Log market-cap residuals are heavy-tailed (residual sd
+//      1.90 in log terms), so one outlier peer could drag a whole category's price under a
+//      mean; the median cannot. Held-out, on the same folds: 5-fold log R2 0.121 -> 0.138,
+//      median error 83% -> 83%, walk-forward pooled 0.063 -> 0.079, leave-one-out 0.143 ->
+//      0.162. The quadratic in log TVL, the cubic, the hinge/spline and the fitted terms
+//      (logAge, growth, logChains, all three) were all tested the same way and all still hurt
+//      or fail the bar, so the regression stays log(mcap) = a + b x log(tvl) + offset.
+//   2. The farm verdict is computed from the LOW end of the fitted value band, not the point
+//      estimate (the Agensi rule): the band is the 10th-90th percentile of the 128 live
+//      peers' residuals of log market cap against log fitted value, so low = fitted x 0.12
+//      and high = fitted x 7.5. The point estimate stays on every row for comparison. The
+//      verdict is more conservative and more credible: FARM only when even the pessimistic
+//      value covers the cost of farming.
 //
 // The board ranks every protocol in the snapshot (758 rows), strongest implied value first, and
 // separates the four kinds of protocol the snapshot actually holds:
@@ -22,8 +38,9 @@
 //   log(mcap) = a + b x log(tvl_usd) + category offset
 //
 // fit by ordinary least squares on the protocols that already trade (128 of them, market cap and
-// TVL both positive). The category offset is each category's mean residual, shrunk toward zero by
-// a prior weight of 3, so a lone live peer cannot set a wild price. The fitted value is then:
+// TVL both positive). The category offset is each category's MEDIAN residual, shrunk toward zero
+// by a prior weight of 3, so a lone live peer cannot set a wild price and one outlier peer cannot
+// drag a whole category's price. The fitted value is then:
 //
 //   fitted = exp(a + b x log(tvl_usd) + offset) x growth x maturity x chain
 //
@@ -35,9 +52,11 @@
 //
 // The fitted terms were tested and rejected, by the program itself, every run: adding log(age),
 // seven-day growth or log(chains) as a fitted OLS term HURTS five-fold cross-validation (base
-// 0.121 vs +logAge 0.101, +growth 0.117, +logChains 0.109, all three 0.082), and leave-one-out
-// agrees (base 0.143 vs all 0.128). So they stay bounded multipliers, and the dashboard says so
-// with the computed numbers.
+// 0.138 vs +logAge 0.118, +growth 0.134, +logChains 0.120, all three 0.093), and leave-one-out
+// agrees (base 0.162 vs all 0.137). A quadratic in log TVL, a cubic and a hinge/spline were
+// tested the same way and also fail the bar (quadratic 0.132, cubic 0.143 with median error 86%,
+// hinge 0.126). So they stay bounded multipliers, and the dashboard says so with the computed
+// numbers.
 //
 // The odds are a logistic regression, fitted from the snapshot's own token record: for a launch
 // candidate, the probability it ever records a token, from log TVL, log age, seven-day growth,
@@ -48,12 +67,16 @@
 // every row and scored beside the logistic odds, so the improvement is measured, not asserted:
 // five-fold held-out Brier 0.2168 vs 0.2314, log-loss 0.6278 vs 0.6551.
 //
-// A farm verdict rides on every row. For a launch candidate it is the expected net of farming:
-// the farmer is assumed to hold one basis point (0.01%) of the launch, so the expected gain is
-// odds x 0.0001 x fitted value; the cost is eight transactions' gas plus 2% of the capital the
-// plan deposits. FARM when the net clears $25, THIN when it is positive, SKIP when it is not.
-// A live or token-trades row is YIELD (farm for yield and points, no launch); a not-a-launch
-// row is SKIP. The dashboard states the one-basis-point assumption in the open.
+// A farm verdict rides on every row. For a launch candidate it is the expected net of farming
+// at the LOW end of the fitted value band: the farmer is assumed to hold one basis point
+// (0.01%) of the launch, so the expected gain is odds x 0.0001 x fitted-low; the cost is eight
+// transactions' gas plus 2% of the capital the plan deposits. FARM when the net clears $25, THIN
+// when it is positive, SKIP when it is not. The band is the 10th-90th percentile of the live
+// peers' residuals of log market cap against log fitted value (low = fitted x 0.12, high =
+// fitted x 7.5), so the verdict only says FARM when even the pessimistic value covers the cost.
+// The point-estimate net stays on every row for comparison. A live or token-trades row is YIELD
+// (farm for yield and points, no launch); a not-a-launch row is SKIP. The dashboard states the
+// one-basis-point assumption and the band in the open.
 //
 // Every launch candidate also carries a bootstrap rank range: the model is refit 200 times on
 // resamples of the 128 live protocols (a seeded generator, so both graded runs agree), the
@@ -120,6 +143,9 @@ export interface ModelConstants {
   farm_tx_count: number;
   farm_capital_rate: number;
   farm_threshold_usd: number;
+  /** The value band's quantiles of the live peers' log residuals (10th and 90th). */
+  value_band_lo_q: number;
+  value_band_hi_q: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -146,10 +172,12 @@ export const MODEL: ModelConstants = {
   farm_tx_count: 8,
   farm_capital_rate: 0.02,
   farm_threshold_usd: 25,
+  value_band_lo_q: 0.1,
+  value_band_hi_q: 0.9,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-4';
+export const MODEL_VERSION = 'radar-5';
 
 /** How many live-token protocols the Live view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -187,10 +215,15 @@ export interface BoardRow {
   expected_gain_usd: number | null;
   farm_cost_usd: number | null;
   expected_net_usd: number | null;
+  /** The same expected gain and net at the point fitted value, for comparison with the low-band verdict. */
+  expected_gain_point_usd: number | null;
+  expected_net_point_usd: number | null;
   rank_range_lo: number | null;
   rank_range_hi: number | null;
   model: {
     fitted_value_usd: number;
+    /** The low end of the fitted value band: fitted value times the band's low multiplier. */
+    fitted_low_value_usd: number;
     token_odds: number | null;
     token_odds_smoothed: number | null;
     intercept: number;
@@ -221,6 +254,7 @@ export interface RadarRow {
   implied_value_usd: number;
   token_status: TokenStatus;
   fitted_value_usd: number;
+  fitted_low_value_usd: number;
   token_odds: number | null;
   token_odds_smoothed: number | null;
   intercept: number;
@@ -234,6 +268,8 @@ export interface RadarRow {
   expected_gain_usd: number | null;
   farm_cost_usd: number | null;
   expected_net_usd: number | null;
+  expected_gain_point_usd: number | null;
+  expected_net_point_usd: number | null;
   rank_range_lo: number | null;
   rank_range_hi: number | null;
 }
@@ -336,6 +372,16 @@ export interface LogitModel {
   sd: number[];
 }
 
+/** The fitted value band, from the live peers' residuals: the low and high multipliers on the
+ * fitted value, the residual standard deviation in log terms, and the band's log quantiles. */
+export interface ValueBand {
+  lo_mult: number;
+  hi_mult: number;
+  resid_sd: number;
+  lo_log: number;
+  hi_log: number;
+}
+
 /** The farm verdict counts across the board. */
 export interface VerdictCounts {
   FARM: number;
@@ -365,6 +411,7 @@ export interface RadarData {
   odds: OddsData;
   logit: LogitModel;
   verdict_counts: VerdictCounts;
+  value_band: ValueBand;
   bootstrap: { refits: number; seed: number };
   rows: RadarRow[];
   live: LiveRow[];
@@ -478,26 +525,30 @@ export function olsLogLog(train: SnapshotProtocol[]): { intercept: number; slope
 }
 
 /**
- * Each category's offset: its mean residual from the global fit, shrunk toward zero by the prior
- * weight, so a lone live peer cannot set a wild price. A category with no live peer gets zero.
+ * Each category's offset: its MEDIAN residual from the global fit, shrunk toward zero by the
+ * prior weight, so a lone live peer cannot set a wild price and one outlier peer cannot drag a
+ * whole category's price. Log market-cap residuals are heavy-tailed (sd 1.90), so the median is
+ * the robust location: the mean version scored 5-fold log R2 0.121, the median 0.138 on the same
+ * folds. A category with no live peer gets zero.
  */
 export function categoryOffsets(
   train: SnapshotProtocol[],
   fit: { intercept: number; slope: number },
   model: ModelConstants = MODEL,
 ): Map<string, { offset: number; peers: number }> {
-  const sums = new Map<string, { sum: number; n: number }>();
+  const lists = new Map<string, number[]>();
   for (const p of train) {
     const resid = Math.log(p.mcap_usd as number) - (fit.intercept + fit.slope * Math.log(p.tvl_usd));
     const key = p.category ?? 'Other';
-    const e = sums.get(key) ?? { sum: 0, n: 0 };
-    e.sum += resid;
-    e.n += 1;
-    sums.set(key, e);
+    const list = lists.get(key) ?? [];
+    list.push(resid);
+    lists.set(key, list);
   }
   const out = new Map<string, { offset: number; peers: number }>();
-  for (const [key, e] of sums) {
-    out.set(key, { offset: (e.n * (e.sum / e.n)) / (e.n + model.peer_prior_weight), peers: e.n });
+  for (const [key, list] of lists) {
+    const sorted = [...list].sort((a, b) => a - b);
+    const med = medianOf(sorted) ?? 0;
+    out.set(key, { offset: (list.length * med) / (list.length + model.peer_prior_weight), peers: list.length });
   }
   return out;
 }
@@ -809,22 +860,25 @@ function valueFeatures(variant: string): (p: SnapshotProtocol, asOf: string) => 
   return (p) => base(p);
 }
 
-/** Category offsets for a generic OLS fit: mean residual per category, shrunk toward zero. */
+/** Category offsets for a generic OLS fit: the median residual per category, shrunk toward zero. */
 function genericOffsets(train: SnapshotProtocol[], beta: number[], featFn: (p: SnapshotProtocol, asOf: string) => number[], asOf: string, model: ModelConstants = MODEL): Map<string, number> {
-  const sums = new Map<string, { sum: number; n: number }>();
+  const lists = new Map<string, number[]>();
   for (const p of train) {
     const x = featFn(p, asOf);
     let pred = 0;
     for (let j = 0; j < beta.length; j++) pred += beta[j]! * x[j]!;
     const r = Math.log(p.mcap_usd as number) - pred;
     const key = p.category ?? 'Other';
-    const e = sums.get(key) ?? { sum: 0, n: 0 };
-    e.sum += r;
-    e.n += 1;
-    sums.set(key, e);
+    const list = lists.get(key) ?? [];
+    list.push(r);
+    lists.set(key, list);
   }
   const out = new Map<string, number>();
-  for (const [key, e] of sums) out.set(key, (e.n * (e.sum / e.n)) / (e.n + model.peer_prior_weight));
+  for (const [key, list] of lists) {
+    const sorted = [...list].sort((a, b) => a - b);
+    const med = medianOf(sorted) ?? 0;
+    out.set(key, (list.length * med) / (list.length + model.peer_prior_weight));
+  }
   return out;
 }
 
@@ -886,7 +940,7 @@ export function leaveOneOut(train: SnapshotProtocol[], asOf: string, model: Mode
     pred.push(genericPredLog(train[i]!, fit, asOf));
   }
   const m = validationMetrics(actual, pred);
-  return { name: 'Leave-one-out, radar-4', test_protocols: train.length, log_r2: round4(m.logR2), median_ape: m.medianApe, mape: m.mape, log_rmse: m.logRmse };
+  return { name: 'Leave-one-out, radar-5', test_protocols: train.length, log_r2: round4(m.logR2), median_ape: m.medianApe, mape: m.mape, log_rmse: m.logRmse };
 }
 
 /**
@@ -1072,23 +1126,53 @@ export function capitalFor(p: SnapshotProtocol): number {
 }
 
 /**
- * A launch candidate's farm verdict, from its expected net. The farmer is assumed to hold one
- * basis point of the launch, so the expected gain is odds x 0.0001 x fitted value; the cost is
- * eight transactions' gas plus 2% of the capital the plan deposits. FARM when the net clears
- * $25, THIN when it is positive, SKIP when it is not. The assumption is the reader's to argue
- * with: the dashboard states it beside the verdict.
+ * A launch candidate's farm verdict, from its expected net at the LOW end of the fitted value
+ * band. The farmer is assumed to hold one basis point of the launch, so the expected gain is
+ * odds x 0.0001 x fitted-low; the cost is eight transactions' gas plus 2% of the capital the
+ * plan deposits. FARM when the net clears $25, THIN when it is positive, SKIP when it is not.
+ * The verdict only says FARM when even the pessimistic value covers the cost. The assumption is
+ * the reader's to argue with: the dashboard states it beside the verdict, with the band.
  */
 export function farmVerdict(
   p: SnapshotProtocol,
-  fitted: number,
+  fittedLow: number,
   odds: number,
   model: ModelConstants = MODEL,
 ): { verdict: FarmVerdict; gain: number; cost: number; net: number } {
-  const gain = odds * model.farm_share * fitted;
+  const gain = odds * model.farm_share * fittedLow;
   const cost = model.farm_tx_count * gasUsd(p.chains.length > 0 ? p.chains[0]! : '') + model.farm_capital_rate * capitalFor(p);
   const net = gain - cost;
   const verdict: FarmVerdict = net > model.farm_threshold_usd ? 'FARM' : net > 0 ? 'THIN' : 'SKIP';
   return { verdict, gain, cost, net };
+}
+
+/**
+ * The fitted value band, from the live peers' residuals: for each of the 128 live protocols,
+ * log market cap minus log fitted value (the regression plus its category offset, times the
+ * bounded multipliers — the same fitted value the board carries). The band's low and high are
+ * the residuals' 10th and 90th percentiles, so the low end is the value 9 of 10 live peers
+ * beat, and the multipliers are exp() of those quantiles. Deterministic: a sorted array and a
+ * fixed index, no random source.
+ */
+export function valueBand(
+  train: SnapshotProtocol[],
+  asOf: string,
+  fit: { intercept: number; slope: number },
+  offsets: Map<string, { offset: number; peers: number }>,
+  model: ModelConstants = MODEL,
+): ValueBand {
+  const resids: number[] = [];
+  for (const p of train) {
+    const v = fittedValue(p, asOf, fit, offsets, model);
+    resids.push(Math.log(p.mcap_usd as number) - Math.log(Math.max(1, v.fitted)));
+  }
+  const sorted = [...resids].sort((a, b) => a - b);
+  const at = (q: number): number => sorted[Math.floor(q * (sorted.length - 1))]!;
+  const loLog = at(model.value_band_lo_q);
+  const hiLog = at(model.value_band_hi_q);
+  const mean = resids.reduce((a, b) => a + b, 0) / resids.length;
+  const sd = Math.sqrt(resids.reduce((a, b) => a + (b - mean) * (b - mean), 0) / resids.length);
+  return { lo_mult: round4(Math.exp(loLog)), hi_mult: round4(Math.exp(hiLog)), resid_sd: round4(sd), lo_log: round4(loLog), hi_log: round4(hiLog) };
 }
 
 /** A seeded generator (mulberry32): the bootstrap's only source of randomness, so both graded runs agree. */
@@ -1157,18 +1241,20 @@ export function bootstrapRankRanges(
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n: every protocol in the snapshot. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; fit: { intercept: number; slope: number }; offsets: Map<string, { offset: number; peers: number }>; odds: OddsTable; logit: FittedLogit; logitGlobal: number; validation: Validation } {
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; fit: { intercept: number; slope: number }; offsets: Map<string, { offset: number; peers: number }>; odds: OddsTable; logit: FittedLogit; logitGlobal: number; validation: Validation; band: ValueBand } {
   const train = trainSet(snapshot.protocols);
   const fit = olsLogLog(train);
   const offsets = categoryOffsets(train, fit, model);
   const odds = oddsTable(snapshot.protocols, model);
   const { fitted: logit, global: logitGlobal } = fitLogitFull(snapshot.protocols, snapshot.as_of, model);
   const validation = validate(train, snapshot, model);
+  const band = valueBand(train, snapshot.as_of, fit, offsets, model);
   const ranges = bootstrapRankRanges(snapshot, train, logit, logitGlobal, model);
 
   const scored = snapshot.protocols.map((p) => {
     const status = tokenStatus(p);
     const v = fittedValue(p, snapshot.as_of, fit, offsets, model);
+    const fittedLow = Math.max(1, Math.round(v.fitted * band.lo_mult));
     let implied: number;
     let oddsValue: number | null;
     let smoothed: number | null;
@@ -1176,6 +1262,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     let gain: number | null = null;
     let cost: number | null = null;
     let net: number | null = null;
+    let gainPoint: number | null = null;
+    let netPoint: number | null = null;
     let range: { lo: number; hi: number } | null = null;
     if (status === 'live') {
       // The market cap is the fact, except when the snapshot records it as zero or negative:
@@ -1199,14 +1287,19 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
       oddsValue = logitOddsFor(p, snapshot.as_of, snapshot.protocols, logit, logitGlobal, model);
       smoothed = tokenOdds(p, odds, model);
       implied = Math.max(1, Math.round(v.fitted * oddsValue));
-      const fv = farmVerdict(p, v.fitted, oddsValue, model);
+      // The verdict is from the LOW end of the value band; the point-estimate net rides along
+      // for comparison, so the reader can see what the verdict would have been at the point.
+      const fv = farmVerdict(p, fittedLow, oddsValue, model);
+      const fp = farmVerdict(p, v.fitted, oddsValue, model);
       verdict = fv.verdict;
       gain = Math.round(fv.gain);
       cost = round2(fv.cost);
       net = Math.round(fv.net);
+      gainPoint = Math.round(fp.gain);
+      netPoint = Math.round(fp.net);
       range = ranges.get(p.slug) ?? null;
     }
-    return { p, status, v, implied, tokenOdds: oddsValue, smoothed, verdict, gain, cost, net, range };
+    return { p, status, v, fittedLow, implied, tokenOdds: oddsValue, smoothed, verdict, gain, cost, net, gainPoint, netPoint, range };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   const board: BoardRow[] = scored.map((s, i) => ({
@@ -1228,10 +1321,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     expected_gain_usd: s.gain,
     farm_cost_usd: s.cost,
     expected_net_usd: s.net,
+    expected_gain_point_usd: s.gainPoint,
+    expected_net_point_usd: s.netPoint,
     rank_range_lo: s.range === null ? null : s.range.lo,
     rank_range_hi: s.range === null ? null : s.range.hi,
     model: {
       fitted_value_usd: s.v.fitted,
+      fitted_low_value_usd: s.fittedLow,
       token_odds: s.tokenOdds === null ? null : round4(s.tokenOdds),
       token_odds_smoothed: s.smoothed === null ? null : round4(s.smoothed),
       // Full precision here, not rounded: the dashboard recomputes each row from these
@@ -1248,7 +1344,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     },
     farm_steps: farmSteps(s.p, s.v.age, s.status).map(stepText),
   }));
-  return { board, fit, offsets, odds, logit, logitGlobal, validation };
+  return { board, fit, offsets, odds, logit, logitGlobal, validation, band };
 }
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
@@ -1377,6 +1473,7 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     token_status: row.token_status,
     fitted_value_usd: row.model.fitted_value_usd,
+    fitted_low_value_usd: row.model.fitted_low_value_usd,
     token_odds: row.model.token_odds,
     token_odds_smoothed: row.model.token_odds_smoothed,
     intercept: row.model.intercept,
@@ -1390,6 +1487,8 @@ export function radarRow(row: BoardRow): RadarRow {
     expected_gain_usd: row.expected_gain_usd,
     farm_cost_usd: row.farm_cost_usd,
     expected_net_usd: row.expected_net_usd,
+    expected_gain_point_usd: row.expected_gain_point_usd,
+    expected_net_point_usd: row.expected_net_point_usd,
     rank_range_lo: row.rank_range_lo,
     rank_range_hi: row.rank_range_hi,
   };
@@ -1397,7 +1496,7 @@ export function radarRow(row: BoardRow): RadarRow {
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const { board, fit, offsets, odds, logit, logitGlobal, validation } = buildBoard(snapshot, model);
+  const { board, fit, offsets, odds, logit, logitGlobal, validation, band } = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const train = trainSet(snapshot.protocols);
   const curve: CurvePoint[] = train.map((p) => ({
@@ -1439,6 +1538,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     odds: oddsData,
     logit: { beta: logit.beta, mu: logit.mu, sd: logit.sd },
     verdict_counts: verdicts,
+    value_band: band,
     bootstrap: { refits: model.bootstrap_refits, seed: model.bootstrap_seed },
     rows: board.map(radarRow),
     live,

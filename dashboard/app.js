@@ -1,4 +1,4 @@
-// Token Radar's dashboard, radar-4. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Token Radar's dashboard, radar-5. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board, a KPI strip, an integrity strip, a top-3 launch spotlight, a
 // filterable table, a per-protocol detail view with the model's own inputs, its farm verdict and
 // the protocol's farm plan, and the fitted curve with the held-out validation. No network: every
@@ -62,7 +62,7 @@
     var odds = (catRate + tierRate) / 2;
     return { odds: Math.min(DATA.model.odds_cap, Math.max(DATA.model.odds_floor, odds)), catRate: catRate, tierRate: tierRate };
   }
-  // The radar-4 odds: a logistic regression on log TVL, log age, seven-day growth, log chain
+  // The radar-5 odds: a logistic regression on log TVL, log age, seven-day growth, log chain
   // count and the category's smoothed token rate. Same features, same standardization and the
   // same dot product main.ts runs, so the recompute matches board.json.
   function catRateFor(row) {
@@ -93,6 +93,7 @@
     var maturity = m.maturity_floor + (Math.min(Math.max(age, 0), m.maturity_days) / m.maturity_days) * m.maturity_range;
     var chain = 1 + m.chain_step * Math.min(Math.max((row.chains || []).length - 1, 0), m.chain_max_bonus);
     var fitted = Math.max(1, Math.round(Math.exp(fittedLog) * growth * maturity * chain));
+    var fittedLow = Math.max(1, Math.round(fitted * DATA.value_band.lo_mult));
     var oddsInfo = null;
     var implied;
     if (row.token_status === 'live') {
@@ -107,7 +108,7 @@
       oddsInfo = { odds: logitOdds(row), smoothed: sm.odds, catRate: sm.catRate, tierRate: sm.tierRate };
       implied = Math.max(1, Math.round(fitted * oddsInfo.odds));
     }
-    return { fitted: fitted, fittedLog: fittedLog, logTvl: logTvl, growth: growth, growthPct: growthPct, maturity: maturity, chain: chain, age: age, odds: oddsInfo, implied: implied };
+    return { fitted: fitted, fittedLow: fittedLow, fittedLog: fittedLog, logTvl: logTvl, growth: growth, growthPct: growthPct, maturity: maturity, chain: chain, age: age, odds: oddsInfo, implied: implied };
   }
 
   function el(tag, attrs) {
@@ -329,9 +330,13 @@
         item('Coverage', DATA.board_size + ' of ' + DATA.board_size + ' protocols'),
         item('Watchlist covered', DATA.watchlist_size + ' of ' + DATA.watchlist_size),
         item('5-fold log R2', fmtR2(cv.log_r2)),
+        item('5-fold median error', (cv.median_ape * 100).toFixed(0) + '%'),
         item('Walk-forward pooled log R2', fmtR2(wf.pooled.log_r2)),
+        item('Walk-forward folds', wf.folds.map(function (f) { return fmtR2(f.log_r2); }).join(' / ')),
         item('Leave-one-out log R2', fmtR2(v.loo.log_r2)),
-        item('Odds Brier, logistic / smoothed', oc.logistic.brier.toFixed(4) + ' / ' + oc.smoothed.brier.toFixed(4))
+        item('Odds Brier, logistic / smoothed', oc.logistic.brier.toFixed(4) + ' / ' + oc.smoothed.brier.toFixed(4)),
+        item('Odds log-loss, logistic / smoothed', oc.logistic.log_loss.toFixed(4) + ' / ' + oc.smoothed.log_loss.toFixed(4)),
+        item('Odds calibration', 'low bin ' + (v.calibration[0].mean_pred * 100).toFixed(0) + '% pred vs ' + (v.calibration[0].actual_rate * 100).toFixed(0) + '% actual; top bin ' + (v.calibration[4].mean_pred * 100).toFixed(0) + '% vs ' + (v.calibration[4].actual_rate * 100).toFixed(0) + '%')
       )
     );
   }
@@ -344,7 +349,7 @@
         el('b', { text: String(DATA.pre_token_size) }), ' launch candidates, ',
         el('b', { text: String(DATA.live_size) }), ' already trading, ',
         el('b', { text: String(DATA.token_trades_size) }), ' whose token already trades through another name, and ',
-        el('b', { text: String(DATA.not_a_launch_size) }), ' that are not a launch. A launch candidate is ranked by its fitted value times the odds it ever records a token; a live protocol is ranked by its market cap, a fact. Each launch candidate carries a farm verdict — FARM, THIN or SKIP — from its expected net against the cost of farming it. Implied value is a model, not a promise.'
+        el('b', { text: String(DATA.not_a_launch_size) }), ' that are not a launch. A launch candidate is ranked by its fitted value times the odds it ever records a token; a live protocol is ranked by its market cap, a fact. Each launch candidate carries a farm verdict — FARM, THIN or SKIP — from its expected net at the low end of its value band against the cost of farming it. TVL ≠ token value: this is a peer-multiple estimate, not a value-capture estimate. Implied value is a model, not a promise.'
       )
     );
   }
@@ -523,7 +528,7 @@
       ),
       el('p', { class: 'model-note' },
         el('b', { text: 'The fitted value: ' }),
-        'a regression of log market cap on log TVL, fit by least squares on the ', String(v.train_protocols), ' protocols that already trade, with each category taking its mean residual shrunk toward zero by a prior weight of ', String(m.peer_prior_weight), '. The fitted value is the conditional median: exp() of the log prediction, with no smearing correction. Growth, maturity and chain are bounded multipliers (growth 1 + clamp(change_7d, ', String(m.growth_floor), ', ', String(m.growth_cap), ') / 100 x ', String(m.growth_weight), '; maturity ', String(m.maturity_floor), ' + min(age, ', String(m.maturity_days), ') / ', String(m.maturity_days), ' x ', String(m.maturity_range), '; chain 1 + 0.02 x min(chains - 1, 5)). They were tested as fitted terms too, by the program, on five-fold cross-validation — held-out log R2: ', ftText, '. Every extra term hurts, so they stay bounded multipliers, not fitted terms. ',
+        'a regression of log market cap on log TVL, fit by least squares on the ', String(v.train_protocols), ' protocols that already trade, with each category taking its median residual shrunk toward zero by a prior weight of ', String(m.peer_prior_weight), '. The fitted value is the conditional median: exp() of the log prediction, with no smearing correction. Growth, maturity and chain are bounded multipliers (growth 1 + clamp(change_7d, ', String(m.growth_floor), ', ', String(m.growth_cap), ') / 100 x ', String(m.growth_weight), '; maturity ', String(m.maturity_floor), ' + min(age, ', String(m.maturity_days), ') / ', String(m.maturity_days), ' x ', String(m.maturity_range), '; chain 1 + 0.02 x min(chains - 1, 5)). They were tested as fitted terms too, by the program, on five-fold cross-validation — held-out log R2: ', ftText, '. Every extra term hurts, so they stay bounded multipliers, not fitted terms. The value band is fitted x ', DATA.value_band.lo_mult.toFixed(2), ' to fitted x ', DATA.value_band.hi_mult.toFixed(1), ' (10th–90th percentile of the ', String(v.train_protocols), ' live peers\u2019 residuals of log market cap against log fitted value); the farm verdict uses the low end. ',
         el('b', { text: 'The odds: ' }),
         'for a launch candidate, a logistic regression on log TVL, log age, seven-day growth, log chain count and its category token rate (Laplace-smoothed toward the global rate (', (DATA.global_token_rate * 100).toFixed(1), '%) with a prior weight of ', String(m.odds_prior_weight), '), standardized, gradient descent lr ', String(m.logit_lr), ', ', String(m.logit_iterations), ' iterations, clamped to [', String(m.odds_floor), ', ', String(m.odds_cap), ']. Coefficients: ', v.logit_coefficients.map(function (b) { return b.toFixed(3); }).join(', '), '. Held-out Brier ', v.odds_comparison.logistic.brier.toFixed(4), ' and log-loss ', v.odds_comparison.logistic.log_loss.toFixed(4), ', against the radar-3 smoothed average (category rate plus TVL-tier rate, halved): Brier ', v.odds_comparison.smoothed.brier.toFixed(4), ', log-loss ', v.odds_comparison.smoothed.log_loss.toFixed(4), '. A protocol that cannot launch (exchange, bridge, liquid-staking product, versioned pool, wrapped or staked name) takes a structural floor of ', String(m.odds_non_launch), '.'
       ),
@@ -589,7 +594,7 @@
         el('div', null,
           el('h3', { text: 'Farm verdicts' }),
           el('p', { class: 'model-note' },
-            'Launch candidates: FARM ', String(DATA.verdict_counts.FARM), ', THIN ', String(DATA.verdict_counts.THIN), ', SKIP ', String(DATA.verdict_counts.SKIP - DATA.not_a_launch_size), ' of ', String(DATA.pre_token_size), '. The verdict assumes the farmer holds 0.01% (one basis point) of the launch, so the expected gain is odds x 0.0001 x fitted value; the cost is ', String(m.farm_tx_count), ' transactions of gas plus ', String(m.farm_capital_rate * 100), '% of the capital the plan deposits. FARM when the net clears $', String(m.farm_threshold_usd), ', THIN when it is positive, SKIP when it is not. A live or token-trades row is YIELD: farm for yield and points, no launch. The one-basis-point share is an assumption, stated here so the reader can argue with it — change it and the verdicts move.'
+            'Launch candidates: FARM ', String(DATA.verdict_counts.FARM), ', THIN ', String(DATA.verdict_counts.THIN), ', SKIP ', String(DATA.verdict_counts.SKIP - DATA.not_a_launch_size), ' of ', String(DATA.pre_token_size), '. The verdict assumes the farmer holds 0.01% (one basis point) of the launch, so the expected gain is odds x 0.0001 x fitted-low value — the low end of the value band (fitted x ', DATA.value_band.lo_mult.toFixed(2), '); the cost is ', String(m.farm_tx_count), ' transactions of gas plus ', String(m.farm_capital_rate * 100), '% of the capital the plan deposits. FARM when the net clears $', String(m.farm_threshold_usd), ', THIN when it is positive, SKIP when it is not. A live or token-trades row is YIELD: farm for yield and points, no launch. The point-estimate net is shown on every row for comparison. The one-basis-point share is an assumption, stated here so the reader can argue with it — change it and the verdicts move.'
           )
         )
       )
@@ -650,6 +655,7 @@
         el('div', null, el('span', { text: 'Fitted log market cap' }), el('b', { class: 'num', text: v.fittedLog.toFixed(2) })),
         el('div', null, el('span', { text: 'Category offset · ' + (row.category || 'Other') + ' (n=' + row.category_live_peers + ')' }), el('b', { class: 'num', text: (row.category_offset >= 0 ? '+' : '') + row.category_offset.toFixed(2) })),
         el('div', null, el('span', { text: 'Fitted value' }), el('b', { class: 'num', text: fmtUsd(v.fitted) })),
+        el('div', null, el('span', { text: 'Fitted value, low end of band' }), el('b', { class: 'num', text: fmtUsd(v.fittedLow) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: fmtMult(v.growth) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: fmtMult(v.maturity) })),
         el('div', null, el('span', { text: 'Chain multiplier (' + (row.chains || []).length + ' chains)' }), el('b', { class: 'num', text: fmtMult(v.chain) })),
@@ -658,14 +664,15 @@
         el('div', null, el('span', { text: 'Category token rate' }), el('b', { class: 'num', text: v.odds && v.odds.catRate !== null ? fmtOdds(v.odds.catRate) : 'n/a' })),
         el('div', null, el('span', { text: 'TVL-tier token rate' }), el('b', { class: 'num', text: v.odds && v.odds.tierRate !== null ? fmtOdds(v.odds.tierRate) : 'n/a' })),
         el('div', null, el('span', { text: 'Farm verdict' }), el('b', { class: 'num', text: row.farm_verdict + (row.expected_net_usd === null || row.expected_net_usd === undefined ? '' : ' · net ' + fmtNet(row.expected_net_usd)) })),
-        el('div', null, el('span', { text: 'Expected gain (odds x 0.01% of fitted)' }), el('b', { class: 'num', text: row.expected_gain_usd === null || row.expected_gain_usd === undefined ? 'n/a' : fmtUsd(row.expected_gain_usd) })),
+        el('div', null, el('span', { text: 'Expected net at the point fitted value' }), el('b', { class: 'num', text: row.expected_net_point_usd === null || row.expected_net_point_usd === undefined ? 'n/a' : fmtNet(row.expected_net_point_usd) })),
+        el('div', null, el('span', { text: 'Expected gain, low end (odds x 0.01% of fitted-low)' }), el('b', { class: 'num', text: row.expected_gain_usd === null || row.expected_gain_usd === undefined ? 'n/a' : fmtUsd(row.expected_gain_usd) })),
         el('div', null, el('span', { text: 'Farm cost (8 tx gas + 2% of capital)' }), el('b', { class: 'num', text: row.farm_cost_usd === null || row.farm_cost_usd === undefined ? 'n/a' : fmtUsd(row.farm_cost_usd) })),
         el('div', null, el('span', { text: 'Bootstrap rank range (200 refits, p10–p90)' }), el('b', { class: 'num', text: row.rank_range_lo === null || row.rank_range_lo === undefined ? 'n/a' : '#' + row.rank_range_lo + ' – #' + row.rank_range_hi })),
         el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'check' }, statusNote),
       calibrationText(row, v) ? el('p', { class: 'check', text: calibrationText(row, v) }) : null,
-      row.token_status === 'pre-token' ? el('p', { class: 'check', text: 'Farm verdict ' + row.farm_verdict + ': the expected gain assumes the farmer holds 0.01% (one basis point) of the launch — odds x 0.0001 x fitted value, ' + fmtUsd(row.expected_gain_usd) + ' — against ' + fmtUsd(row.farm_cost_usd) + ' of gas and capital cost. FARM when the net clears $' + DATA.model.farm_threshold_usd + ', THIN when it is positive, SKIP when it is not.' }) : null,
+      row.token_status === 'pre-token' ? el('p', { class: 'check', text: 'Farm verdict ' + row.farm_verdict + ': the expected gain assumes the farmer holds 0.01% (one basis point) of the launch — odds x 0.0001 x fitted-low value (fitted x ' + DATA.value_band.lo_mult.toFixed(2) + '), ' + fmtUsd(row.expected_gain_usd) + ' — against ' + fmtUsd(row.farm_cost_usd) + ' of gas and capital cost. At the point fitted value the net would be ' + fmtNet(row.expected_net_point_usd) + '. FARM when the net clears $' + DATA.model.farm_threshold_usd + ', THIN when it is positive, SKIP when it is not.' }) : null,
       el('p', { class: 'check' },
         'Model ' + DATA.model_version + ': the page recomputes this row as ',
         el('b', { text: fmtUsd(v.implied) }),
